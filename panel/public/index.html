@@ -1629,6 +1629,21 @@ function toast(msg, ms = 2200) {  const t = $('toast');
   t._t = setTimeout(() => t.classList.remove('show'), ms);
 }
 
+/**
+ * 双确认：不可撤销的操作要求点两次确认。
+ *
+ * 为什么不是一次：浏览器 confirm 的「确定」按钮在同一个位置，
+ * 一次弹窗很容易被连点/误触带过去 —— 而「清空记忆」「删除文件」这类操作
+ * 没有回收站、没有撤销，点错就是真没了。
+ *
+ * 两次的文案不能一样：第二次要更具体地说清「会失去什么」，
+ * 让点的人重新读一遍，而不是条件反射再点一次。
+ */
+function confirmTwice(first, second) {
+  if (!window.confirm(first)) return false;
+  return window.confirm(second);
+}
+
 async function api(path, opts = {}) {
   const r = await fetch(path, {
     credentials: 'same-origin',
@@ -1938,7 +1953,16 @@ $('fs-list').addEventListener('click', (e) => {
       return;
     }
     if (act === 'del') {
-      if (!confirm(`确定删除「${name}」？${isDir ? '会连里面的东西一起删！' : ''}此操作不可恢复。`)) return;
+      // 删除没有回收站，删错就是真没了 —— 也走双确认
+      const dirNote = isDir ? '这是个文件夹，会连里面的所有东西一起删！' : '';
+      const go = confirmTwice(
+        `确定删除「${name}」？${dirNote}此操作不可恢复。`,
+        `第二次确认：真的要删除「${name}」吗？\n\n` +
+          '面板没有回收站，删掉之后找不回来。\n' +
+          (isDir ? '文件夹里的内容会一起消失。\n\n' : '\n') +
+          '确定继续？'
+      );
+      if (!go) return;
       api('/api/fs/delete', { method: 'POST', body: JSON.stringify({ root: fsRootName, path: full }) })
         .then(() => loadFs()).catch((err) => toast('删除失败：' + err.message));
       return;
@@ -2196,7 +2220,23 @@ async function loadMemory() {
 
 $('btnMemReload').onclick = () => loadMemory();
 $('btnMemClear').onclick = async () => {
-  if (!confirm('清空它记住的所有人和事？这个操作不能撤销。')) return;
+  /*
+   * 双确认。文案要说准「清什么、不清什么」——
+   * 这个接口只把 AGENTS.local.md 重置成空白模板，**不动**对话历史/立场/黑话/日程。
+   * 写成「清空所有记忆」会吓到人，也让人误以为能靠它「重新开始」。
+   */
+  const go = confirmTwice(
+    '清空她的长期记忆？\n\n' +
+      '会删掉她自己记下的东西：你的名字、约定、喜好、忌讳、重要日期、正在做的事。\n' +
+      '（AGENTS.local.md 会被重置成空白模板）\n\n' +
+      '注意：对话历史、立场、黑话词库不受影响。\n' +
+      '此操作不能撤销。',
+    '第二次确认：真的清空长期记忆吗？\n\n' +
+      '清空后她不再「记得」你告诉过她的具体事情，只能靠最近几十轮对话临时撑着；\n' +
+      '一旦这些对话被压缩掉，就真的什么都不剩了。\n\n' +
+      '没有备份，无法恢复。确定继续？'
+  );
+  if (!go) return;
   try {
     await api('/api/memory', { method: 'DELETE' });
     toast('已清空');
