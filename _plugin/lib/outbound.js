@@ -82,7 +82,22 @@ export class OutboundPipeline {
             }
             let sentCard = false;
             const threshold = this.ctx.config.textImageThreshold;
-            if (threshold > 0 && body.length > threshold) {
+            /*
+             * 【必须】面板与 dsh 之间的内部标记不能渲染成图片卡片。
+             *
+             * 为什么：t2i 发生在插件这一层，而面板的剥除逻辑在插件**之后**（代理层）。
+             * 一旦转成图片，面板收到的只有 image 段、没有 text：
+             *   - parseLearnReceipt / parseMeaningReceipt 拿到空串，全部返回 null
+             *   - 连「以 [[学词]] 开头就吞掉」的兜底正则也匹配不到（因为它读的是空串）
+             *   - 结果：整段内部 JSON 原样发到对方聊天里
+             *
+             * 实测事故：2026-10-23「研究含义」任务返回 2000+ 字释义 JSON，
+             * 超过默认阈值 150，被渲染成「To <昵称>」卡片发给了用户。
+             *
+             * 不转图后走文本路径，面板能正常剥除；剥干净后为空就不发送。
+             */
+            const hasInternalMark = /\[\[\s*(生词|学词|释义|对话状态)/.test(body);
+            if (!hasInternalMark && threshold > 0 && body.length > threshold) {
                 try {
                     const chat = this.ctx.getChat(chatId);
                     const title = chat !== undefined && chat.lastNickname !== ''

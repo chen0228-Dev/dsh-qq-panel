@@ -3987,3 +3987,123 @@ QQ 侧提示机器人离线；日志每 30 秒一条「待投 20 条」，**却�
 - 13.8.4 的坑里，**只有 1/3/4/5 是我实际核对过路径的**；
   2（slug 机制）、9（版本兼容）、12（时区）、13（计数）属于**基于代码和文件结构的推断**，
   没有真机迁移验证，迁移时以实测为准。
+
+---
+
+## 五十六、内部标记被渲染成图片卡片发给了用户（2026-10-23，真实事故）
+
+### 现象
+
+用户在 QQ 里收到一张图片：标题「To 我」、页脚 `Powered by dsh`，
+点开是**完整的内部回执** —— `[[释义]] [{"word":"不烧心",...}]`，
+十几个词条、2000 多字，一个不漏。
+
+这不是乱码，是黑话「研究含义」任务本该被面板吞掉的 JSON。
+
+### 根因（三层防线，第一层就漏了）
+
+```
+模型输出 [[释义]] [2000+字 JSON]
+   ↓
+① 插件 outbound.js：body.length(2000+) > textImageThreshold(默认 150)
+   → renderTextImage() 渲染成卡片 → 发图片，sentCard=true，**文本不再发送**
+   ↓
+② 面板代理（剥除逻辑在这一层，即插件之后）
+   → 收到的帧里只有 image 段，没有 text
+   ↓
+③ parseMeaningReceipt('') → null
+   兜底 /^\s*\[\[\s*(学词|释义)/ → 匹配空串 → 也 null
+   → 图片原样发出
+```
+
+**为什么平时看不见**：日常回复很少超过 150 字，而「研究含义」一次十几个词条必然超。
+所以这 bug 只在黑话研究任务里出现。
+
+**为什么插件里 `title` 是「To 我」**：`outbound.js` 第 88-89 行
+`const title = chat.lastNickname !== '' ? 'To ' + chat.lastNickname : undefined`。
+
+### 改法（两处，缺一不可）
+
+| 文件 | 改动 |
+|---|---|
+| `_plugin/lib/outbound.js` | t2i 之前加 `hasInternalMark` 判断：`/\[\[\s*(生词\|学词\|释义\|对话状态)/` 命中就不转图，走文本路径交给面板剥 |
+| `panel/lib/proxy.js` | 兜底正则**去掉 `^`**（原来只认「整段以标记开头」，模型在前面加一句引导语就漏）；**把 `[[对话状态]]` 纳入兜底**（原来它完全没有兜底，解析失败就会漏发一行 JSON） |
+
+### 验证
+
+新增 `tests/internal-mark-test.mjs`，**20 项全过**：
+
+- 插件层 8 项：纯标记 / 前有引导语 / 学词 / 对话状态 / 行内 `[[生词]]` /
+  截断未闭合 / 普通长回复照常转图 / 普通方括号不误杀
+- 面板兜底 9 项：含「对话状态坏了（原来没兜底会漏）」和「正文里提到『释义』两个字不该误杀」
+- 事故原文 3 项：插件不做卡片 ✅、面板整条丢弃 ✅、长度确实 > 150 ✅
+
+服务端回归：`slang-test` 74、`groups-test` 26、`proxy-outbound-test` 8、
+`quote-test` 全过。dsh-web 与 qqbot-panel 重启后
+`已连接 dsh` / `OneBot connected` / `bridge ready (2 resumed chat)`。
+
+### 取舍
+
+兜底**不判断位置**（出现即丢弃）。误杀风险是「正文里真写了 `[[释义]]` 这几个字」——
+正常聊天不该有；反过来说，漏发的代价是内部协议直接暴露给对方，不可接受。
+
+### 已知未解决
+
+- **没有真实触发一次研究任务来验证**。逻辑、部署、回归都验了，
+  但真正的端到端确认要等下一次「研究含义」（面板按钮或 23:30 定时）。
+- 插件补丁**会在升级 dsh-onebot 时被覆盖**（和字体补丁一样），升级后必须重打。
+
+### 回滚
+
+```bash
+cp /opt/qqbot/_bak/1023-2105-internal-mark/proxy.js /opt/qqbot/panel/lib/proxy.js
+cp /opt/qqbot/_bak/1023-2105-internal-mark/outbound.js \
+   /root/.dsh/profiles/web/node_modules/dsh-onebot-qq/lib/outbound.js
+systemctl restart qqbot-panel dsh-web
+```
+
+---
+
+## 五十七、记忆备份脚本（2026-10-23，新增）
+
+### 背景
+
+项目代码丢了能重建（GitHub + `D:\open_小柒`），但**记忆丢了找不回来**——
+那是聊出来的，没有第二个副本。
+
+### 做了什么
+
+`D:\小柒\备份记忆.sh`：一条命令把这 6 类文件打包下载到本地。
+
+| # | 内容 | 服务器路径 | 备份时大小 |
+|---|---|---|---|
+| 1 | 长期记忆 | `qq-workspace/AGENTS.local.md` | 2.3K / 26 行 |
+| 2 | 对话正本 | `.dsh/sessions/--root-qq-workspace--/*/session.v4.jsonl.zstd` | 3.2M（主号） |
+| 3 | 会话映射 | `.dsh/media/onebot/chat-sessions.json` | 108 字节 |
+| 4 | 状态 | `panel/data/*.json` | 约 22K |
+| 5 | 表情库 | `qq-workspace/stickers/` | 3.8M / 29 个 |
+| 6 | 投影缓存 | `.dsh/storages/session_projcache/` | 264K |
+
+输出到 `D:\小柒\记忆\最新\`（解包）+ `历史\`（tar.gz，自动只留最近 5 份）。
+
+### 首次备份结果
+
+75 个文件 / 7.5M。关键项全部核对：
+`AGENTS.local.md` 2288 字节可读、两个会话正本的 zstd 文件头都是 `28b52ffd`、
+`sessions` 下 20 个文件全在。
+
+### 一个容易漏的细节
+
+服务器上 `sessions/` 有**两个 slug 目录**：
+
+```
+--root-qq-workspace--     ← 当前在用（主号 + 访客）
+--root-dsh_workspace--    ← 旧路径的历史会话（8 个）
+```
+
+目录名由**工作区绝对路径**生成。恢复时路径必须一致，否则 dsh 认不出这些会话 = 失忆。
+
+### 没做的
+
+- 没做「定时自动备份」——按用户要求，等记忆变多了手动再跑一次即可。
+- 没有版本对比，每次都是全量覆盖 `最新\`（历史归档保留 5 份用于回溯）。
