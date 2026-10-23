@@ -190,11 +190,15 @@ dsh（DeepSeek Harness，独立进程）
 
 | 需要 | 说明 |
 |---|---|
-| 一台 Linux 服务器 | 本项目按 Ubuntu 24.04 验证；1.7G 内存可跑（无 GPU 需求） |
-| Node.js ≥ 22 | 面板只依赖 `ws` 一个包 |
-| [NapCat](https://github.com/NapNeko/NapCatQQ) | OneBot 11 协议端，负责登 QQ；Docker 或 Termux 均可 |
+| 一台能跑 Node.js 的机器 | **Linux / Windows / macOS 都行**，不挑发行版。开发时长期在 Ubuntu 24.04 上跑，见下面一节的适配说明 |
+| Node.js ≥ 22 | 面板只依赖 `ws` 一个包，**没有原生模块**，不存在编译问题 |
+| [NapCat](https://github.com/NapNeko/NapCatQQ) | OneBot 11 协议端，负责登 QQ；Docker / 桌面版 / Termux 均可 |
 | [DeepSeek Harness](https://github.com/deepseek-ai) | 提供 Agent 能力，`dsh web` 需能启动 |
 | 一个 QQ 小号 | 建议专用小号，主号有风险 |
+
+> **内存不是门槛**。1.7G 的小机器实测能跑完整套（面板 + dsh + NapCat），
+> 但那三样加起来才吃这么多。面板自己很轻，给个 `--max-old-space-size=192` 就够用。
+> 有 GPU 更好（跑本地语音模型用），没有也完全不影响主要功能。
 
 ### 三步
 
@@ -214,6 +218,33 @@ PANEL_PORT=18080 PANEL_DATA=./data node server.js
 
 **完整部署（含坑位排查）见 [`docs/DEPLOY-HANDBOOK.md`](docs/DEPLOY-HANDBOOK.md)**，
 那是这个项目最值钱的部分：每一步都有验证方法，第 8 节按「现象 → 根因 → 改法」收录了 41 条踩过的坑。
+
+### 部署到 Windows / 其他发行版 / 手机
+
+**面板本体跨平台没有障碍**——纯 Node.js，零原生模块。上面那三步之所以写得像 Linux 专用，
+是因为默认配置贴着 systemd + Docker 写的。换环境真正要动的只有下面这几处：
+
+| 要改的 | Ubuntu（默认，已验证） | Windows | 其他 Linux 发行版 |
+|---|---|---|---|
+| **服务管理** | `systemctl`，`server.js` 里 5 处（搜 `systemctl` 即可定位） | 没有 systemd → 用「任务计划程序」开机启动、`nssm` 注册服务，或一个 `start.cmd` 常驻 | CentOS / Arch / Debian 都有 systemd，**一行都不用改** |
+| **NapCat** | Docker 容器名 `napcat`，8 处 docker 调用 | 用 NapCatQQ 桌面版直接跑；面板的「重启 NapCat」改走进程管理 | Docker 通用，**不用改** |
+| **抓 dsh 登录 token** | `journalctl`，2 处：`server.js` 取日志、`dsh-proxy.js` 的 `readRawPatchToken()` 抓 token | **这一处必须改**：Windows 没有 journalctl，改成读 dsh 的日志文件 | 有 journald 就不用改 |
+| **数据目录** | 默认 `/opt/qqbot/panel` | 环境变量 `PANEL_ROOT` / `PANEL_DATA` 指到 `D:\...` | 同 Windows |
+| **工作区路径** | `config.json` 的 `paths.workspace`（默认 `/root/qq-workspace`） | 改成带盘符的绝对路径 | 改成实际路径即可 |
+| **`qq-*` 工具** | 装进 `/usr/local/bin` + 加执行位 | 没有 `#!/usr/bin/env python3` 这回事 → 要么在 WSL / Git Bash 里跑，要么给每个脚本写 `.cmd` 包装 | 同 Linux |
+
+最麻烦的是**第 3 行**。面板靠 `journalctl` 从 dsh 日志里正则抓登录 token，
+Windows 上这条链路直接断掉。改法不复杂：把 dsh 的 stdout 重定向到文件，读那个文件就行——
+解析逻辑在 `readRawPatchToken()` 里，只需换数据来源，正则不用动。
+
+其余都是"换个路径、换个进程管理"的量级，不涉及业务逻辑。
+
+> **诚实说明**：这个项目实际长期跑在 Ubuntu 24.04 + Docker NapCat 上，
+> 上面 Windows 那一列是**按代码结构分析出来的**，不是实测结论。
+> 手机 Termux 属于第三条路（NapCat 官方有 Termux 安装脚本，面板要改的地方和 Windows 类似），
+> 手册第 13 节有一份施工清单。真要上非常规环境，建议先只把 NapCat 跑起来验证 QQ 能不能稳定挂着，
+> 再搬面板——那样出问题容易定位。
+
 
 ### 配置
 
