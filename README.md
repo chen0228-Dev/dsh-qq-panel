@@ -213,7 +213,7 @@ PANEL_PORT=18080 PANEL_DATA=./data node server.js
 然后浏览器打开 `http://<your-server-ip>:18080`，首次会要求设密码，进去按页填。
 
 **完整部署（含坑位排查）见 [`docs/DEPLOY-HANDBOOK.md`](docs/DEPLOY-HANDBOOK.md)**，
-那是这个项目最值钱的部分：每一步都有验证方法，第 8 节按「现象 → 根因 → 改法」收录了 40 多条踩过的坑。
+那是这个项目最值钱的部分：每一步都有验证方法，第 8 节按「现象 → 根因 → 改法」收录了 41 条踩过的坑。
 
 ### 配置
 
