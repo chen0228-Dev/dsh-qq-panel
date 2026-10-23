@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+/**
+ * qq-sticker —— 看看自己有哪些表情包。
+ *
+ * 为什么不是直接 ls 目录：文件名多半是 `007.png` 这种模型看不懂的东西，
+ * 真正有用的是每张图的情绪标签和「什么时候用它」的说明，那是 index.json 里的。
+ *
+ * 用法：
+ *   qq-sticker              列出全部（每行「文件名 — 情绪标签；用法说明」）
+ *   qq-sticker -n 20        只看前 20 张
+ *   qq-sticker --json       输出原始 JSON，方便自己筛选
+ */
+const LIB = process.env.QQPANEL_LIB || '/opt/qqbot/panel/lib'
+const CAP_FILE = process.env.QQCAP_FILE || '/root/qq-workspace/.capabilities.json'
+
+function disabled() {
+  try {
+    const caps = JSON.parse(require('node:fs').readFileSync(CAP_FILE, 'utf8'))
+    if (caps && caps.sticker === false) return true
+  } catch {
+    /* 读不到就当开着，不因为一张坏配置就把命令废掉 */
+  }
+  return false
+}
+
+async function main() {
+  if (disabled()) {
+    console.log('[能力已关闭：sticker] 需要先在控制面板的「表情包」页打开。')
+    process.exit(2)
+  }
+
+  const args = process.argv.slice(2)
+  const asJson = args.includes('--json')
+  let limit = 100
+  const nIdx = args.indexOf('-n')
+  if (nIdx >= 0 && args[nIdx + 1]) limit = Number(args[nIdx + 1]) || 100
+
+  const path = require('node:path')
+  const lib = await import(path.join(LIB, 'stickers.js'))
+  const cfg = await import(path.join(LIB, 'store.js')).then((m) => m.loadConfig())
+
+  const files = lib.listStickers()
+  const max = Number(cfg.stickers?.max) || 100
+
+  if (!files.length) {
+    console.log(`库存是空的（上限 ${max} 张）。`)
+    console.log('可以用 qq-save-sticker 在聊天里收图，或者让主人在面板上上传几张。')
+    return
+  }
+
+  if (asJson) {
+    console.log(JSON.stringify({ count: files.length, max, files }, null, 2))
+    return
+  }
+
+  console.log(`库存 ${files.length} / ${max} 张（${cfg.paths.stickers}）`)
+  for (const line of lib.renderCatalog(limit)) console.log(line)
+  if (files.length > limit) console.log(`…… 还有 ${files.length - limit} 张，加 -n 参数看全`)
+  console.log('')
+  console.log('发图：qq_send_image(sources=["' + cfg.paths.stickers + '/<上面某个文件名>"])')
+}
+
+main().catch((e) => {
+  console.log(`[错误] ${e.message}`)
+  process.exit(1)
+})

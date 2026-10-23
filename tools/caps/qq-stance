@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""qq-stance —— 把「你对某件事的看法」记进立场库。
+
+立场库分两部分：
+- 天生就有的（写在程序里，聊到的时候会自动提醒你）；
+- 你自己记的（这个命令管的）—— 聊天聊出来的、或者上网搜到什么之后形成的看法。
+
+记下来之后，以后聊到同一件事，你都会按这个说法来。所以别乱记：
+只记你真的有感觉、而且以后还会聊到的事。
+
+用法：
+  qq-stance list                                   看看自己记了什么
+  qq-stance add "熬夜,作息" "十二点前睡是自欺欺人" "躺下就开始刷手机"
+  qq-stance add "某部剧,结局" "结尾崩了" "前面铺得那么好，最后十分钟全毁" --src search
+  qq-stance del 2                                  删掉第 2 条
+
+注意：
+- 第一个参数是「标签」，逗号分隔。标签决定以后哪句话会触发这条立场，
+  所以要写别人真的会说的词（「香菜」「早八」），别写句子。
+- 同一条标签只留一条，再记会覆盖旧的 —— 免得自己跟自己打架。
+- 最多 40 条，满了要先删。
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap  # noqa: E402
+
+DATA_DIR = os.environ.get("QQBOT_DATA", "/opt/qqbot/panel/data")
+FILE = os.path.join(DATA_DIR, "stances.json")
+MAX = 40
+
+
+def load():
+    try:
+        with open(FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        items = d.get("items") if isinstance(d, dict) else None
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def save(items):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"items": items}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, FILE)
+
+
+def when(ts):
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(int(ts) / 1000))
+    except Exception:
+        return "?"
+
+
+def fmt(item, idx):
+    tags = ",".join(item.get("tags") or [])
+    src = {"search": "搜到的", "chat": "聊出来的"}.get(item.get("src") or "", "")
+    extra = f"（{when(item.get('at'))}{'，' + src if src else ''}）" if item.get("at") else ""
+    return f"{idx:>2}. [{tags}] {item.get('take')}{extra}"
+
+
+def cmd_list(_):
+    items = load()
+    if not items:
+        print("立场库里还没有你自己记的东西。")
+        print("聊到什么事让你有感觉，就用：qq-stance add \"标签\" \"你的态度\" \"为什么\"")
+        return
+    print(f"你自己记的立场（{len(items)}/{MAX} 条）：")
+    for i, it in enumerate(items, 1):
+        print(" " + fmt(it, i))
+    print("删掉某条：qq-stance del 编号")
+
+
+def cmd_add(a):
+    tags = [t.strip() for t in str(a.tags).replace("，", ",").split(",") if t.strip()]
+    take = " ".join(str(a.take or "").split())
+    why = " ".join(str(a.why or "").split())
+    if not tags:
+        qqcap.die("第一个参数是标签，逗号分隔，比如 \"香菜,点菜\"")
+    if not take:
+        qqcap.die("要说清楚你的态度，比如 \"香菜是灾难\"")
+    if len(take) > 60:
+        qqcap.die(f"态度太长了（{len(take)} 字），控制在一句话以内")
+
+    items = load()
+    main = tags[0]
+    # 主标签相同就算同一件事，覆盖旧的 —— 否则她会对同一件事有两种说法
+    hit = next((i for i, it in enumerate(items) if (it.get("tags") or [""])[0] == main), None)
+    new = {
+        "id": f"s_{int(time.time() * 1000)}",
+        "tags": tags[:4],
+        "take": take,
+        "why": why,
+        "at": int(time.time() * 1000),
+        "src": "search" if a.src == "search" else "chat",
+    }
+
+    if hit is not None:
+        new["id"] = items[hit].get("id") or new["id"]
+        items[hit] = new
+        save(items)
+        print(f"[已更新] 「{main}」的说法换成了：{take}")
+    else:
+        if len(items) >= MAX:
+            qqcap.die(f"立场库满了（{MAX} 条）。先用 qq-stance list 看看，删掉几条不重要的。")
+        items.append(new)
+        save(items)
+        print(f"[已记下] {main} → {take}")
+    print(f"现在一共 {len(items)} 条（上限 {MAX}）。以后聊到「{main}」，你会按这个说法来。")
+
+
+def cmd_del(a):
+    items = load()
+    n = a.index
+    if n < 1 or n > len(items):
+        qqcap.die(f"没有第 {n} 条。先 qq-stance list 看看编号。")
+    gone = items.pop(n - 1)
+    save(items)
+    print(f"[已删] {gone.get('take')}")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description="记下你的立场")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_list = sub.add_parser("list", help="看看自己记了什么")
+    p_list.set_defaults(func=cmd_list)
+
+    p_add = sub.add_parser("add", help="记一条新立场")
+    p_add.add_argument("tags", help="标签，逗号分隔（别人会说的词）")
+    p_add.add_argument("take", help="你的态度，一句话")
+    p_add.add_argument("why", nargs="?", default="", help="一句理由")
+    p_add.add_argument("--src", choices=["chat", "search"], default="chat", help="从哪来的")
+    p_add.set_defaults(func=cmd_add)
+
+    p_del = sub.add_parser("del", help="删掉某条")
+    p_del.add_argument("index", type=int)
+    p_del.set_defaults(func=cmd_del)
+
+    a = ap.parse_args()
+    if not getattr(a, "func", None):
+        print(__doc__)
+        return
+
+    qqcap.need("stances")
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()

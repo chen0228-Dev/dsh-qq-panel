@@ -1,0 +1,30 @@
+# 统一换行符：仓库里一律用 LF
+# 原因：tools/caps/ 下的 qq-* 是带 shebang 的可执行脚本，
+#       带 CRLF 时 Linux/macOS 会报 `bad interpreter: python3^M`，直接跑不起来。
+* text=auto eol=lf
+
+# 明确声明这些是「在 Linux 上直接执行」的脚本，必须 LF
+*.sh   text eol=lf
+*.py   text eol=lf
+
+# 二进制文件不做任何换行符转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.bmp   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.zip   binary
+*.gz    binary
+*.7z    binary
+*.mp3   binary
+*.wav   binary
+*.ogg   binary
+*.m4a   binary
+*.mp4   binary
+*.pdf   binary

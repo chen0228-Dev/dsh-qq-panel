@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""qq-search —— 联网搜索，多引擎兜底。
+
+为什么不用单一 Bing：实测「奶蛙 梗」这种新梗，Bing 中文结果基本是空的，
+百度/360/搜狗才有（同一个词，百度页里命中 700+ 次，Bing 只有 5 次且是搜索框回显）。
+
+顺序是「360 → 搜狗 → 百度 → Bing」，不是拍脑袋：
+- 360 移动端/PC 页最干净，命中率也高，前几条基本是真结果；
+- 搜狗次之，偶尔会掺视频聚合页；
+- 百度放第三个，是因为它在无 cookie 直连时经常掉验证页
+  （只返回「百度安全验证」那种壳，解析出来 0 条），放前面纯属浪费一次超时；
+- Bing 垫底，中文长尾/新梗基本查不到，只当英文词的最后一块补丁。
+
+抓回来的结果还要过一遍 junk 过滤（见 is_junk）：
+抓 HTML 的老毛病是会把搜索框回显、时间轴、JS 源码、相关搜索词条当成结果，
+这些进了模型上下文会把它带偏，宁缺毋滥。
+
+用法：
+  qq-search "奶蛙 是什么梗"
+  qq-search "周杰伦 新歌" -n 3
+  qq-search "某个词" --engine baidu
+"""
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+UA_M = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
+UA_D = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def strip_tags(s):
+    s = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", s or "", flags=re.S | re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return html.unescape(re.sub(r"\s+", " ", s)).strip()
+
+
+def uniq(items):
+    seen = set()
+    out = []
+    for it in items:
+        u = it["url"].split("#")[0]
+        if not u.startswith("http") or u in seen:
+            continue
+        seen.add(u)
+        out.append(it)
+    return out
+
+
+# 摘要里出现这些，基本就是从页面里刮下来的代码/导航垃圾，不是真结果
+JUNK_SNIPPET = ("大家还在搜", "相关搜索", "var ", "function(", "function (", "window.", "document.",
+                "百度安全验证", "请输入验证码", "点击展开全文", "查看更多>>")
+# 标题里出现这些，是搜索站自己的功能页/品牌页，不是答案
+JUNK_TITLE = ("百度一下，你就知道", "百度安全验证", "搜索-360", "搜狗搜索", "必应")
+JUNK_TITLE_RE = re.compile(r"^[\s\d:：\-–—·.|/]*$")   # 纯时间轴/纯数字/纯符号
+
+
+def is_junk(title, snippet):
+    t = (title or "").strip()
+    s = (snippet or "").strip()
+    if len(t) < 4:                      # 「12:34」「3.5万」这种根本不是标题
+        return True
+    if JUNK_TITLE_RE.match(t):
+        return True
+    if any(k in t for k in JUNK_TITLE):
+        return True
+    # 标题整条就是个时长「00:12 / 03:45」，视频站时间轴被当成结果了
+    if re.match(r"^\d{1,2}[:：]\d{2}([:：]\d{2})?$", t):
+        return True
+    if any(k in s for k in JUNK_SNIPPET):
+        return True
+    return False
+
+
+def parse_baidu(page):
+    """百度移动布局：<div class="c-result result ..."> 里包一条结果。"""
+    out = []
+    for block in re.split(r'(?=<div[^>]*class="c-result result)', page):
+        if "c-result result" not in block[:200]:
+            continue
+        m = re.search(r'<a[^>]*href="(http[^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        url = html.unescape(m.group(1))
+        title = strip_tags(m.group(2))
+        # 摘要：优先 class 带 summary/content/abstract 的块，兜底取最长的一段文本
+        snip = ""
+        sm = re.search(r'class="[^"]*(?:summary|content|abstract)[^"]*"[^>]*>(.*?)</div>', block, re.S)
+        if sm:
+            snip = strip_tags(sm.group(1))
+        if not snip:
+            texts = [t.strip() for t in re.findall(r">([^<>]{20,200})<", block)]
+            snip = max(texts, key=len) if texts else ""
+        if title and len(title) > 1:
+            out.append({"title": title, "url": url, "snippet": snip, "src": "百度"})
+    return out
+
+
+def parse_360(page):
+    out = []
+    for block in re.split(r'(?=<li[^>]*class="res-list)', page):
+        if "res-list" not in block[:120]:
+            continue
+        m = re.search(r'<h3[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        sm = re.search(r'class="res-desc"[^>]*>(.*?)</p>', block, re.S)
+        title = strip_tags(m.group(2))
+        if title:
+            out.append(
+                {
+                    "title": title,
+                    "url": html.unescape(m.group(1)),
+                    "snippet": strip_tags(sm.group(1)) if sm else "",
+                    "src": "360",
+                }
+            )
+    return out
+
+
+def parse_sogou(page):
+    out = []
+    for block in re.split(r'(?=<div[^>]*class="(?:vrwrap|rb))', page):
+        m = re.search(r'<h3[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        url = html.unescape(m.group(1))
+        if url.startswith("/"):
+            url = "https://www.sogou.com" + url
+        sm = re.search(r'class="(?:str-text|text-layout|space-txt)[^"]*"[^>]*>(.*?)</div>', block, re.S)
+        title = strip_tags(m.group(2))
+        if title:
+            out.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "snippet": strip_tags(sm.group(1)) if sm else "",
+                    "src": "搜狗",
+                }
+            )
+    return out
+
+
+def parse_bing(page):
+    out = []
+    for block in re.findall(r'<li class="b_algo".*?</li>', page, re.S):
+        m = re.search(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        p = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        title = strip_tags(m.group(2))
+        if title:
+            out.append(
+                {
+                    "title": title,
+                    "url": html.unescape(m.group(1)),
+                    "snippet": strip_tags(p.group(1)) if p else "",
+                    "src": "Bing",
+                }
+            )
+    return out
+
+
+DS_SEARCH = "https://api.deepseek.com/v1/tools/search"
+
+
+def deepseek_search(q, n, key):
+    """
+    DeepSeek 官方 Search API（2026-10-17 上线）。
+
+    按「成功请求」计费（约 5 元/千次，空结果不计费），比抓 HTML 稳得多 ——
+    抓取那边百度会掉验证页、360 只给跳转链，官方接口直接给标题/链接/摘要/长摘要。
+    """
+    body = json.dumps({"query": q, "count": max(1, min(50, n)), "need_content": False}, ensure_ascii=False)
+    req = urllib.request.Request(
+        DS_SEARCH,
+        data=body.encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    out = []
+    for it in data.get("results") or []:
+        out.append(
+            {
+                "title": it.get("title") or "",
+                "url": it.get("url") or "",
+                "snippet": it.get("summary") or it.get("snippet") or "",
+                "src": (it.get("site_name") or "DeepSeek")[:10],
+            }
+        )
+    return out
+
+
+ENGINES = {
+    "baidu": lambda q: (
+        "https://www.baidu.com/s?wd=" + urllib.parse.quote(q) + "&ie=utf-8",
+        UA_M,
+        parse_baidu,
+        {"Accept-Language": "zh-CN,zh;q=0.9"},
+    ),
+    "360": lambda q: (
+        "https://www.so.com/s?q=" + urllib.parse.quote(q),
+        UA_D,
+        parse_360,
+        {"Accept-Language": "zh-CN,zh;q=0.9"},
+    ),
+    "sogou": lambda q: (
+        "https://www.sogou.com/web?query=" + urllib.parse.quote(q),
+        UA_D,
+        parse_sogou,
+        {"Accept-Language": "zh-CN,zh;q=0.9"},
+    ),
+    "bing": lambda q: (
+        "https://cn.bing.com/search?q=" + urllib.parse.quote(q) + "&setlang=zh-CN",
+        UA_D,
+        parse_bing,
+        {"Accept-Language": "zh-CN,zh;q=0.9"},
+    ),
+}
+
+ORDER = ["360", "sogou", "baidu", "bing"]
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("query", nargs="+")
+    ap.add_argument("-n", "--num", type=int, default=5)
+    ap.add_argument("--engine", default="auto", choices=ORDER + ["auto"])
+    args = ap.parse_args()
+
+    qqcap.need("search")
+    q = " ".join(args.query).strip()
+    if not q:
+        qqcap.die("请给我一个搜索词")
+
+    n = max(1, min(10, args.num))
+
+    # 配了 DeepSeek 的 key 就优先走官方接口，失败再退回抓取
+    provider, key = qqcap.search_cred()
+    if provider == "deepseek" and args.engine == "auto":
+        try:
+            items = deepseek_search(q, n, key)[:n]
+            if items:
+                print(f'搜索「{q}」，取前 {len(items)} 条（DeepSeek 官方搜索）：')
+                for i, it in enumerate(items, 1):
+                    print(f"\n{i}. {qqcap.clip(it['title'], 90)}　[{it['src']}]")
+                    print(f"   {it['url']}")
+                    if it["snippet"]:
+                        print(f"   {qqcap.clip(it['snippet'], 200)}")
+                print("\n要看正文：qq-browse <上面某个链接>。")
+                return
+            print(f"「{q}」官方搜索没返回结果，改试抓取。")
+        except Exception as e:
+            print(f"官方搜索失败（{qqcap.clip(str(e), 80)}），改试抓取。")
+
+    engines = [args.engine] if args.engine != "auto" else ORDER
+
+    items = []
+    tried = []
+    for name in engines:
+        if len(items) >= n:
+            break
+        try:
+            url, ua, parser, hdr = ENGINES[name](q)
+            status, page = qqcap.http_get(url, dict(hdr, **{"User-Agent": ua}), timeout=20)
+            got = parser(page) if status == 200 else []
+        except Exception as e:
+            tried.append(f"{name}=异常({qqcap.clip(str(e), 30)})")
+            continue
+        raw = len(got)
+        got = [it for it in got if not is_junk(it["title"], it["snippet"])]
+        tried.append(f"{name}={len(got)}" + (f"(滤掉{raw - len(got)})" if raw > len(got) else ""))
+        if got:
+            items = uniq(items + got)
+
+    if not items:
+        print(f'没有搜到「{q}」的结果。（各引擎：{"，".join(tried)}）')
+        print("可以换个说法再搜，或者直接把链接/截图发过来。")
+        return
+
+    items = items[:n]
+    print(f'搜索「{q}」，取前 {len(items)} 条（各引擎产出：{"，".join(tried)}）：')
+    for i, it in enumerate(items, 1):
+        print(f"\n{i}. {qqcap.clip(it['title'], 90)}　[{it['src']}]")
+        print(f"   {it['url']}")
+        if it["snippet"]:
+            print(f"   {qqcap.clip(it['snippet'], 180)}")
+    print("\n要看正文：qq-browse <上面某个链接>（百度/搜狗给的是跳转链，qq-browse 会自动跟过去）。")
+
+
+if __name__ == "__main__":
+    main()

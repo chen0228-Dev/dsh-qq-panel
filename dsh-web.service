@@ -1,0 +1,19 @@
+[Unit]
+Description=DeepSeek Harness Web (dsh)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/dsh web
+Restart=always
+RestartSec=5
+WorkingDirectory=/root
+Environment=NODE_ENV=production
+Environment=TZ=Asia/Shanghai
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

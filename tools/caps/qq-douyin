@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""qq-douyin —— 解析抖音分享链接：拿文案/作者/数据，抽帧让人（模型）看画面。
+
+思路：模型看不懂视频，但看得懂图片。所以把视频均匀抽几帧，
+再用 read_image 逐张看，等于把视频「拆成连环画」。
+
+用法：
+  qq-douyin "<分享链接或整段分享文案>"             元信息 + 抽 6 帧
+  qq-douyin "<链接>" --frames 8                    抽 8 帧
+  qq-douyin "<链接>" --video                       保留视频文件并给出路径
+  qq-douyin "<链接>" --cover                       只下封面图
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+WORK = "/root/qq-workspace/douyin"
+YTDLP = shutil.which("yt-dlp") or "/usr/local/bin/yt-dlp"
+
+
+def extract_url(text):
+    """用户经常直接粘贴一整段分享文案，从里面捞第一个链接。"""
+    m = re.search(r"https?://[^\s，。、\"'）)】]+", text or "")
+    return m.group(0) if m else (text or "").strip()
+
+
+def run(cmd, timeout=180):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def expand(url):
+    """解开 v.douyin.com 短链，看落到 /video/ 还是 /note/。"""
+    r = run(
+        ["curl", "-sL", "-o", "/dev/null", "-m", "20", "-A", qqcap.UA, "-w", "%{url_effective}", url],
+        timeout=30,
+    )
+    out = (r.stdout or "").strip()
+    return out if out.startswith("http") else url
+
+
+def hint_blocked(detail=""):
+    """所有路都走不通时的兜底：给一句能直接说给用户听的话。"""
+    print(f"这条抖音我这边确实解析不出来（内部原因：{detail or '机房 IP 被风控'}）。")
+    print("")
+    print("对对方就这么说：这条链接我打不开，你把里面的画面截图发我，我看得更准。")
+    print("如果他要的是视频里的过程，让他录一小段发过来也行。")
+    print("")
+    print("注意：不要把「cookie / 签名 / 风控 / 钥匙」这些词说给对方听 —— 那是内部原因，")
+    print("说出来像在推责任，对方也帮不上忙。")
+
+
+def probe(url):
+    r = run([YTDLP, "-J", "--no-warnings", "--no-playlist", "--socket-timeout", "20", url])
+    if r.returncode != 0 or not r.stdout.strip():
+        err = " ".join((r.stderr or "").strip().splitlines()[-3:])
+        low = err.lower()
+        if "fresh cookies" in low or "cookies are needed" in low:
+            hint_blocked("需要浏览器 cookie（msToken / 签名），服务器这边拿不到")
+        if "unsupported url" in low and "/note/" in url:
+            hint_blocked("这是图文作品（/note/），yt-dlp 只支持 /video/，图文接口要签名")
+        qqcap.die(f"解析失败：{qqcap.clip(err, 220)}")
+    try:
+        return json.loads(r.stdout)
+    except Exception as e:
+        qqcap.die(f"返回内容解析失败：{e}")
+
+
+def duration_of(info):
+    d = info.get("duration") or 0
+    try:
+        return float(d)
+    except Exception:
+        return 0.0
+
+
+def download_video(url, dst):
+    r = run(
+        [
+            YTDLP,
+            "-f",
+            "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b[ext=webm]/b",
+            "--no-warnings",
+            "--no-playlist",
+            "--socket-timeout",
+            "20",
+            "-o",
+            dst,
+            url,
+        ],
+        timeout=240,
+    )
+    if r.returncode != 0 or not os.path.exists(dst):
+        return None
+    return dst
+
+
+def extract_frames(video, outdir, count, width=640):
+    os.makedirs(outdir, exist_ok=True)
+    for old in glob.glob(os.path.join(outdir, "frame-*.jpg")):
+        os.unlink(old)
+
+    dur = 0.0
+    r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", video])
+    try:
+        dur = float((r.stdout or "0").strip())
+    except Exception:
+        dur = 0.0
+    if dur <= 0:
+        return []
+
+    count = max(2, min(12, count))
+    fps = count / dur
+    pattern = os.path.join(outdir, "frame-%02d.jpg")
+    r = run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            video,
+            "-vf",
+            f"fps={fps:.6f},scale='min({width},iw)':-2",
+            "-frames:v",
+            str(count),
+            "-q:v",
+            "4",
+            pattern,
+        ],
+        timeout=180,
+    )
+    return sorted(glob.glob(os.path.join(outdir, "frame-*.jpg")))
+
+
+def download_cover(info, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    url = info.get("thumbnail")
+    if not url:
+        return None
+    dst = os.path.join(outdir, "cover.jpg")
+    r = run(["curl", "-sL", "-m", "30", "-A", qqcap.UA, "-o", dst, url])
+    return dst if os.path.exists(dst) and os.path.getsize(dst) > 1024 else None
+
+
+# ---- 图文作品（/note/）----
+
+NOTE_API = "https://api.xingzhige.com/API/douyin/"
+
+
+DS_FETCH = "https://api.deepseek.com/v1/tools/fetch"
+
+
+def fetch_share_meta(real_url):
+    """
+    第三方解析服务挂了时的兜底：用 DeepSeek 的 Fetch 读抖音**分享页**。
+
+    实测 www.douyin.com/note|video 会被拦（HTTP 404），但 iesdouyin 的 share 页能读，
+    返回的正文里有完整文案和点赞数据（只是没有图片直链）。
+    有文案也够它说个大概了，比一句「你截图发我」强。
+    """
+    provider, key = qqcap.search_cred()
+    if provider != "deepseek":
+        return "", ""
+    m = re.search(r"/(note|video)/(\d+)", real_url or "")
+    if not m:
+        return "", ""
+    share = f"https://www.iesdouyin.com/share/{m.group(1)}/{m.group(2)}/"
+    body = json.dumps({"url": share}).encode("utf-8")
+    req = urllib.request.Request(
+        DS_FETCH,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return "", ""
+    title = d.get("title") or ""
+    content = re.sub(r"\\([\\`*_{}\[\]()#+\-.!:>|~])", r"\1", d.get("content") or "")
+    # 把播放器那堆 UI 单词洗掉，只留像人话的行
+    keep = [ln.strip() for ln in content.splitlines() if len(ln.strip()) >= 8]
+    return title, "\n".join(keep)[:800]
+
+
+def note_api(url):
+    """
+    图文（抖音叫「图集/笔记」）没法用 yt-dlp：它只认 /video/，`/note/` 直接
+    Unsupported URL；抖音自己的 web 接口又要 a_bogus 签名 + cookie，机房 IP 拿不到。
+    所以这里走一个公开的解析服务，把 note 的图片列表、文案、作者、数据取回来。
+    """
+    q = urllib.parse.quote(url, safe="")
+    req = urllib.request.Request(
+        f"{NOTE_API}?url={q}", headers={"User-Agent": qqcap.UA, "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    if data.get("code") != 0:
+        raise RuntimeError(data.get("msg") or "解析服务返回失败")
+    d = data.get("data") or {}
+    item = d.get("item") or {}
+    return {
+        "id": str((d.get("jx") or {}).get("item_id") or (d.get("stat") or {}).get("aweme_id") or ""),
+        "type": (d.get("jx") or {}).get("type") or "",
+        "title": (item.get("title") or "").strip(),
+        "author": (d.get("author") or {}).get("name") or "",
+        "images": item.get("images") or [],
+        "cover": item.get("cover") or "",
+        "stat": d.get("stat") or {},
+        # 视频作品才有：
+        "video_url": item.get("url") or "",
+        "duration": item.get("duration") or 0,
+        "quality": item.get("quality") or "",
+        "size": item.get("size") or 0,
+    }
+
+
+def video_mode(url, args, real):
+    """
+    视频作品：先用公开解析服务拿**直链 mp4**，绕开 yt-dlp 的 cookie/签名问题。
+
+    yt-dlp 卡在「Fresh cookies are needed」——那是抖音 web 接口的签名校验，
+    机房 IP 过不去。解析服务返回的 `item.url` 是 douyinvod 的签名直链，
+    服务器能直接下（实测 1.85MB / 15 秒 / hevc，ffmpeg 正常解码）。
+    返回 False 表示没搞定，让调用方退回 yt-dlp 老路。
+    """
+    try:
+        info = note_api(url)
+        play = info.get("video_url") or ""
+        if not play:
+            return False
+    except Exception as e:
+        print(f"（公开解析没拿到视频直链：{qqcap.clip(str(e), 100)}，改试 yt-dlp）")
+        return False
+
+    vid = info["id"] or str(int(time.time()))
+    outdir = os.path.join(WORK, vid)
+    os.makedirs(outdir, exist_ok=True)
+    dst = os.path.join(outdir, "video.mp4")
+
+    r = run(["curl", "-sL", "-m", "120", "-A", "Mozilla/5.0", "-o", dst, play], timeout=150)
+    if not os.path.exists(dst) or os.path.getsize(dst) < 10 * 1024:
+        print("（直链下载失败，改试 yt-dlp）")
+        return False
+
+    dur = float(info.get("duration") or 0)
+    print(f"标题：{qqcap.clip(info['title'], 200) or '（无）'}")
+    print(f"作者：{qqcap.clip(info['author'], 40) or '未知'}")
+    if dur:
+        m, s = divmod(int(dur), 60)
+        print(f"时长：{m}:{s:02d}　画质：{info.get('quality') or '未知'}")
+    st = info.get("stat") or {}
+    bits = []
+    for key, label in (("like", "点赞"), ("comment", "评论"), ("collect", "收藏"), ("share", "分享")):
+        if st.get(key) is not None:
+            bits.append(f"{label} {st[key]}")
+    if bits:
+        print("数据：" + " · ".join(bits))
+
+    frames = extract_frames(dst, outdir, args.frames) if dur > 0 else []
+    if frames:
+        print(f"\n画面抽了 {len(frames)} 帧（{int(dur)} 秒均匀取样）：")
+        for f in frames:
+            print("  " + f)
+        print("\n下一步：用 read_image 依次看上面每一张，再结合标题描述画面里发生了什么。")
+    else:
+        print("\n视频下下来了但抽帧失败，只能凭文案说。")
+
+    if args.video:
+        print(f"\n视频文件：{dst}（{os.path.getsize(dst) / 1048576:.1f} MB），可以 qq_send_video 发出去。")
+    else:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+    return True
+
+
+def download_images(urls, outdir, limit):
+    os.makedirs(outdir, exist_ok=True)
+    for old in glob.glob(os.path.join(outdir, "img-*.jpg")):
+        os.unlink(old)
+    saved = []
+    for i, u in enumerate(urls[: max(1, min(12, limit))], 1):
+        dst = os.path.join(outdir, f"img-{i:02d}.jpg")
+        r = run(["curl", "-sL", "-m", "40", "-A", qqcap.UA, "-o", dst, u], timeout=60)
+        if os.path.exists(dst) and os.path.getsize(dst) > 2048:
+            saved.append(dst)
+        elif os.path.exists(dst):
+            os.unlink(dst)
+    return saved
+
+
+def note_mode(url, args, real):
+    """图文作品：把图存下来，交给模型用 read_image 一张张看。"""
+    try:
+        info = note_api(real if "/note/" in real else url)
+    except Exception as e:
+        title, text = fetch_share_meta(real)
+        if title or text:
+            print("图集直链没拿到，但把文案读到了（只有文字，没有画面）：")
+            if title:
+                print(f"标题：{qqcap.clip(title, 200)}")
+            if text:
+                print("")
+                print(text)
+            print("")
+            print("可以照着文案聊，但**不要说画面里有什么** —— 你没看到图。")
+            print("要聊画面就跟对方说：图我这边加载不出来，你截图发我。")
+            return
+        print("图文这条解析不出来。")
+        print(f"原因：{qqcap.clip(str(e), 120)}")
+        print("")
+        print("别硬猜内容。直接跟对方说：这条图集我这边打不开，你把里面的图截图发我。")
+        return
+
+    vid = info["id"] or str(int(time.time()))
+    outdir = os.path.join(WORK, vid)
+    images = download_images(info["images"], outdir, args.frames)
+
+    print(f"类型：{info['type'] or '图集'}（{len(info['images'])} 张图）")
+    print(f"标题：{qqcap.clip(info['title'], 200) or '（无）'}")
+    print(f"作者：{qqcap.clip(info['author'], 40) or '未知'}")
+    st = info.get("stat") or {}
+    bits = []
+    for key, label in (("like", "点赞"), ("comment", "评论"), ("collect", "收藏"), ("share", "分享")):
+        if st.get(key) is not None:
+            bits.append(f"{label} {st[key]}")
+    if bits:
+        print("数据：" + " · ".join(bits))
+
+    if images:
+        print(f"\n图存好了 {len(images)} 张：")
+        for p in images:
+            print("  " + p)
+        print("\n下一步：用 read_image 依次看上面每一张（尤其是带文字的那几张），")
+        print("把画面内容和图上写的字说给对方听 —— 图文作品的「内容」基本都在图里。")
+    elif info.get("cover"):
+        cover = download_images([info["cover"]], outdir, 1)
+        if cover:
+            print(f"\n只拿到封面：{cover[0]}")
+            print("用 read_image 看一眼，然后告诉对方「只看到封面」。")
+        else:
+            print("\n图一张都没下下来，直接跟对方说打不开、让他发截图。")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("target")
+    ap.add_argument("--frames", type=int, default=6)
+    ap.add_argument("--video", action="store_true", help="保留视频文件")
+    ap.add_argument("--cover", action="store_true", help="只下封面")
+    args = ap.parse_args()
+
+    qqcap.need("douyin")
+
+    url = extract_url(args.target)
+    if not url.startswith("http"):
+        qqcap.die("没找到链接，把抖音的分享链接或整段分享文案发过来就行")
+
+    # 先解开短链：图文作品（/note/）和视频（/video/）走的是两套接口
+    real = expand(url)
+    if "/note/" in real or "/share/note/" in real:
+        # 图文（图集）走公开解析服务，把图下下来给 read_image 看
+        note_mode(url, args, real)
+        return
+
+    # 视频：先试公开解析服务（能拿到 douyinvod 直链），失败再退回 yt-dlp
+    if video_mode(url, args, real):
+        return
+
+    info = probe(url)
+    vid = str(info.get("id") or int(time.time()))
+    outdir = os.path.join(WORK, vid)
+    os.makedirs(outdir, exist_ok=True)
+
+    title = (info.get("title") or info.get("description") or "").strip()
+    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "未知"
+    dur = duration_of(info)
+    likes = info.get("like_count")
+    comments = info.get("comment_count")
+    webpage = info.get("webpage_url") or url
+
+    print(f"标题：{qqcap.clip(title, 120) or '（无）'}")
+    print(f"作者：{qqcap.clip(uploader, 40)}")
+    if dur:
+        m, s = divmod(int(dur), 60)
+        print(f"时长：{m}:{s:02d}")
+    stats = []
+    if likes is not None:
+        stats.append(f"点赞 {likes}")
+    if comments is not None:
+        stats.append(f"评论 {comments}")
+    if stats:
+        print("数据：" + " · ".join(stats))
+    print(f"链接：{webpage}")
+
+    cover = download_cover(info, outdir)
+    if cover:
+        print(f"封面：{cover}")
+
+    if args.cover:
+        print("\n用 read_image 看封面即可。")
+        return
+
+    frames = []
+    video_path = None
+    if dur > 0:
+        video_path = download_video(url, os.path.join(outdir, "video.mp4"))
+        if video_path:
+            frames = extract_frames(video_path, outdir, args.frames)
+        else:
+            print("（视频没下下来，只拿到封面和文案）")
+
+    if frames:
+        print(f"\n画面抽了 {len(frames)} 帧（视频时长 {int(dur)} 秒，均匀取样）：")
+        for f in frames:
+            print("  " + f)
+        print("\n下一步：用 read_image 依次看上面每一张，再结合标题描述画面里发生了什么。")
+    elif not cover:
+        print("\n没拿到画面，只能凭文案说。")
+
+    if args.video and video_path:
+        size_mb = os.path.getsize(video_path) / 1048576
+        print(f"\n视频文件：{video_path}（{size_mb:.1f} MB），可以直接 qq_send_video 发出去。")
+    elif video_path and os.path.exists(video_path):
+        os.unlink(video_path)  # 只要帧，视频不占磁盘
+
+
+if __name__ == "__main__":
+    main()

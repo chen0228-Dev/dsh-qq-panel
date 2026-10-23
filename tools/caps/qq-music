@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""qq-music —— 搜歌、看歌词、看热评（数据来自网易云公开接口）。
+
+用法：
+  qq-music "晴天"                搜歌，列前 5 首
+  qq-music "晴天" -l             顺带给出第一首的歌词（前 24 行）
+  qq-music "晴天" -c             顺带给出前几首的热门评论
+  qq-music --id 186016 -l -c     直接指定歌曲 id
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+HDR = {"Referer": "https://music.163.com", "Accept": "application/json"}
+CAP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def sibling(name):
+    """调同目录下的兄弟脚本。优先用当前解释器直接跑，避免依赖 PATH 和可执行位
+    （Windows 上没有后缀的脚本根本执行不了，本地就测不了）。"""
+    p = os.path.join(CAP_DIR, name)
+    return [sys.executable, p] if os.path.exists(p) else [name]
+
+
+def api(url):
+    status, text = qqcap.http_get(url, HDR)
+    if status != 200:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def search(q, limit=5):
+    url = (
+        "https://music.163.com/api/search/get/web?s="
+        + urllib.parse.quote(q)
+        + f"&type=1&limit={limit}&offset=0"
+    )
+    d = api(url) or {}
+    return ((d.get("result") or {}).get("songs")) or []
+
+
+# 这些版本不是用户要的原唱，除非用户自己点名要
+BAD_VER = ("cover", "翻唱", "伴奏", "纯音乐", "dj版", "remix", "片段", "铃声",
+           "女声版", "男声版", "钢琴版", "吉他版", "慢摇", "加速版", "降调")
+
+
+def norm(s):
+    """去掉空格标点、统一小写，只留「字」，用于比对歌名/歌手。"""
+    return re.sub(r"[\s\-_·・.。、,，！!?？'\"“”‘’()（）\[\]【】]", "", (s or "")).lower()
+
+
+def rank_songs(songs, q):
+    """
+    把用户真正想要的那首顶到第一位。
+
+    原来直接取接口第 0 条，结果经常是「晴天 (Cover 周杰伦)」「晴天 DJ版」这种，
+    后面 -l / -c / --story 全都围着翻唱转，模型拿到的歌词和背景是错的人。
+    打分规则：歌名精确命中 > 歌名包含 > 查询里点了歌手名 > 两者都点中，翻唱/伴奏类扣分。
+    """
+    nq = norm(q)
+    scored = []
+    for s in songs:
+        name = s.get("name") or ""
+        nn = norm(name)
+        artists = [(a.get("name") or "") for a in (s.get("artists") or [])]
+        na = norm("".join(artists))
+        sc = 0.0
+        if nn and nn == nq:
+            sc += 100
+        elif nn and nq and (nn in nq or nq in nn):
+            sc += 45
+        if na and nq and na in nq:              # 用户写了歌手：「周杰伦 晴天」
+            sc += 55
+        if nn and na and nn in nq and na in nq:
+            sc += 30
+        if any(k in nn for k in BAD_VER):
+            sc -= 40
+        sc += min(10.0, (s.get("popularity") or s.get("pop") or 0) / 10.0)
+        scored.append((sc, s))
+    scored.sort(key=lambda x: -x[0])
+    return [s for _, s in scored]
+
+
+def lyric(song_id):
+    d = api(f"https://music.163.com/api/song/lyric?id={song_id}&lv=1&kv=1&tv=-1") or {}
+    lrc = (d.get("lrc") or {}).get("lyric") or ""
+    lines = []
+    for line in lrc.splitlines():
+        line = re.sub(r"^\[[^\]]*\]\s*", "", line).strip()
+        if line and not line.startswith("作词") and not line.startswith("作曲"):
+            lines.append(line)
+    return lines
+
+
+def hot_comments(song_id, limit=5):
+    d = api(f"https://music.163.com/api/v1/resource/comments/R_SO_4_{song_id}?limit={limit}") or {}
+    out = []
+    for c in (d.get("hotComments") or d.get("comments") or [])[:limit]:
+        nick = ((c.get("user") or {}).get("nickname") or "匿名").strip()
+        body = " ".join(str(c.get("content") or "").split())
+        if body:
+            out.append((nick, body, c.get("likedCount") or 0))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("query", nargs="*")
+    ap.add_argument("--id", dest="song_id", type=int)
+    ap.add_argument("-l", "--lyric", action="store_true")
+    ap.add_argument("-c", "--comments", action="store_true")
+    ap.add_argument("--story", action="store_true", help="联网查这首歌的背景/为什么火")
+    ap.add_argument("-n", "--num", type=int, default=5)
+    args = ap.parse_args()
+
+    qqcap.need("music")
+
+    if args.song_id:
+        songs = [{"id": args.song_id, "name": f"id:{args.song_id}", "artists": [], "album": {}}]
+    else:
+        q = " ".join(args.query).strip()
+        if not q:
+            qqcap.die("请给我歌名或歌手")
+        # 先一次拉 30 首候选再排序：接口自己按「热度/相关度」给的前 5 条里
+        # 经常压根没有原唱（「晴天」前五全是翻唱），池子浅了排序也救不回来。
+        songs = search(q, max(12, min(30, args.num * 5)))
+        if not songs:
+            print(f"没搜到「{q}」。")
+            return
+        songs = rank_songs(songs, q)[: max(1, min(10, args.num))]
+        print(f"搜「{q}」：")
+        for i, s in enumerate(songs, 1):
+            artists = " / ".join(a.get("name", "") for a in (s.get("artists") or []))
+            album = (s.get("album") or {}).get("name", "")
+            dur = s.get("duration") or 0
+            mm, ss = divmod(int(dur // 1000), 60)
+            print(f'{i}. {s.get("name")} — {artists}' + (f" · 《{album}》" if album else "") + f" · {mm}:{ss:02d} · id={s.get('id')}")
+
+        # 同名版本扎堆时明确提醒一句。匿名调这个接口拿不到完整曲库，
+        # 有些原唱（比如周杰伦《晴天》）压根不在返回里，只能给到翻唱——
+        # 不提醒的话模型会顺口说「《晴天》是某某唱的」，等于是拿错资料编答案。
+        def base_title(s):
+            return norm(re.split(r"[(（\[]", s.get("name") or "")[0])
+
+        bt = base_title(songs[0])
+        same = [s for s in songs if base_title(s) == bt] if bt else []
+        if len(same) > 1:
+            who = "、".join(
+                " / ".join(a.get("name", "") for a in (s.get("artists") or [])) for s in same[:3]
+            )
+            print(f"（注意：同名版本有 {len(same)} 条，唱的人不一样（{who}…）。"
+                  f"要指定就写「歌名 歌手」，别默认第一条就是原唱。）")
+
+    target = songs[0]
+    sid = target.get("id")
+    name = target.get("name")
+    artists = " / ".join(a.get("name", "") for a in (target.get("artists") or []))
+
+    if args.lyric:
+        lines = lyric(sid)
+        print(f"\n《{name}》{('— ' + artists) if artists else ''} 歌词（前 24 行）：")
+        if not lines:
+            print("  （这首歌没有公开歌词）")
+        else:
+            for line in lines[:24]:
+                print("  " + line)
+            if len(lines) > 24:
+                print(f"  ……（共 {len(lines)} 行）")
+
+    if args.comments:
+        cm = hot_comments(sid, 5)
+        print(f"\n《{name}》热门评论：")
+        if not cm:
+            print("  （暂时拿不到评论）")
+        for nick, body, likes in cm:
+            print(f"  · {nick}（{likes} 赞）：{qqcap.clip(body, 90)}")
+
+    if args.story:
+        # 歌词和热评是「歌里有什么」，背景是「这首歌为什么存在」——
+        # 后者曲库给不了，走联网搜索。梗曲、翻红的老歌最需要这一段。
+        # 加「原唱」是为了避开翻唱页；只留 8 行、每行 120 字，是防止把
+        # 搜索结果里的标题+摘要+跳转串整坨灌进模型上下文（原来一次能塞两千多字，
+        # 里面还有一堆歌词片段和「大家还在搜」，模型会照着复读）。
+        qn = f"{name} {artists} 原唱 创作背景 为什么火".strip()
+        print(f"\n《{name}》的背景（联网查的）：")
+        r = subprocess.run(sibling("qq-search") + [qn, "-n", "3"], capture_output=True, text=True, timeout=90)
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        kept = set()
+        shown = 0
+        for ln in out.splitlines():
+            t = ln.strip()
+            if not t:
+                continue
+            # 搜索工具自己的话术 / 链接 / 引擎统计，一律不给模型看
+            if t.startswith(("搜索「", "要看正文", "没有搜到", "http", "可以换个说法")):
+                continue
+            if re.match(r"^\d{1,2}[:：]\d{2}", t):          # 时间轴
+                continue
+            if t.startswith(("##", "作词", "作曲", "编曲", "歌词")):
+                continue
+            body = qqcap.clip(t, 120)
+            if body in kept:                               # 各引擎结果高度重复
+                continue
+            kept.add(body)
+            print("  " + body)
+            shown += 1
+            if shown >= 8:
+                break
+        if not shown:
+            print("  （这次没查到有用的背景，别硬编，实话说不清楚就行）")
+
+    if not args.lyric and not args.comments and not args.story:
+        print(f"\n想了解这首歌：-l 看歌词、-c 看热评、--story 查背景；也可以 --id {sid} 直接指定。")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""qq-browse —— 打开一个网页，把正文抽成纯文本。
+
+为什么要它：qq-search 只给标题和摘要，遇到「这个梗到底是什么」经常不够。
+有了这个就能顺着结果页点进去读原文，读完再说话。
+
+顺带处理两件麻烦事：
+- 百度/搜狗/360 的搜索结果给的是跳转链（/link?url=...），这里会自动跟到真实地址；
+- 页面里的导航、广告、脚本全剥掉，只留能读的正文，太长的截断。
+
+用法：
+  qq-browse "https://zh.wikipedia.org/wiki/奶蛙"
+  qq-browse "https://baijiahao.baidu.com/s?id=xxx" --chars 2000
+"""
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# 这些标签里的东西不是正文
+DROP = re.compile(r"<(script|style|noscript|iframe|svg|nav|footer|header|form)\b.*?</\1>", re.S | re.I)
+
+
+def extract(html_text):
+    """把 HTML 变成一段一段的文字。不追求完美，够模型读就行。"""
+    t = DROP.sub(" ", html_text)
+    # 标题
+    mt = re.search(r"<title[^>]*>(.*?)</title>", t, re.S | re.I)
+    title = html.unescape(re.sub(r"\s+", " ", mt.group(1))).strip() if mt else ""
+    # 段落级别换行
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = re.sub(r"</(p|div|li|h[1-6]|tr|section|article|blockquote)>", "\n", t, flags=re.I)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = html.unescape(t)
+    lines = []
+    for raw in t.split("\n"):
+        s = re.sub(r"[ \t\u3000]+", " ", raw).strip()
+        # 丢掉特别短的行（导航、按钮、版权）
+        if len(s) >= 12:
+            lines.append(s)
+    # 去重相邻重复行（很多站会把标题重复两遍）
+    dedup = []
+    for s in lines:
+        if not dedup or dedup[-1] != s:
+            dedup.append(s)
+    return title, "\n".join(dedup)
+
+
+def find_jump(text):
+    """
+    搜索结果里的跳转页不是 302，而是一段 JS / meta refresh：
+      <script>window.location.replace("https://真实地址")</script>
+      <meta http-equiv="refresh" content="0;URL='https://真实地址'">
+    urllib 不会执行 JS，所以得自己把真实地址抠出来再抓一次。
+    """
+    # 三种写法都要认：location.replace("x") 是**函数调用**，不是赋值 ——
+    # 一开始只写了赋值形式，360 的跳转页就永远跟不过去。
+    m = re.search(r'''location\.replace\(\s*["']([^"']+)''', text, re.I)
+    if not m:
+        m = re.search(r'''location(?:\.href)?\s*=\s*["']([^"']+)''', text, re.I)
+    if not m:
+        m = re.search(r'''content=["'][^"']*[Uu][Rr][Ll]=([^"' >]+)''', text, re.I)
+    return html.unescape(m.group(1)).strip("'\" ") if m else ""
+
+
+def fetch(url, timeout=25):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        final = r.geturl()
+        ctype = r.headers.get("Content-Type", "")
+    charset = "utf-8"
+    m = re.search(r"charset=([\w-]+)", ctype, re.I)
+    if m:
+        charset = m.group(1)
+    else:
+        m2 = re.search(rb'charset=["\']?([\w-]+)', raw[:2048], re.I)
+        if m2:
+            charset = m2.group(1).decode("ascii", "ignore")
+    try:
+        text = raw.decode(charset, "replace")
+    except LookupError:
+        text = raw.decode("utf-8", "replace")
+    return final, text
+
+
+DS_FETCH = "https://api.deepseek.com/v1/tools/fetch"
+
+
+def deepseek_fetch(url, key):
+    """
+    DeepSeek 官方 Fetch API：直接把网页转成 Markdown 返回。
+
+    比本地正则抠正文稳得多 —— 那边已经渲染过、剥过导航，标题也干净。
+    按成功请求计费（约 5 元/千次），失败不计费。
+    """
+    req = urllib.request.Request(
+        DS_FETCH,
+        data=json.dumps({"url": url}, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=45) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    return data.get("title") or "", data.get("content") or ""
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("url")
+    ap.add_argument("--chars", type=int, default=1500)
+    args = ap.parse_args()
+
+    qqcap.need("search")
+    url = args.url.strip()
+    if not url.startswith("http"):
+        qqcap.die("给我一个 http(s) 开头的链接")
+
+    # 配了 DeepSeek 的 key 就走官方 Fetch（返回干净的 Markdown），失败再退回本地抽
+    provider, key = qqcap.search_cred()
+    if provider == "deepseek":
+        try:
+            dtitle, content = deepseek_fetch(url, key)
+            # 官方返回的 Markdown 会把 # - : 之类转义成 \# \- \:，打印前还原成人话
+            content = re.sub(r"\\([\\`*_{}\[\]()#+\-.!:>|~])", r"\1", content)
+            if content.strip():
+                limit0 = max(200, min(8000, args.chars))
+                print(f"标题：{qqcap.clip(dtitle, 120) or '（无）'}")
+                print(f"地址：{url}")
+                print(f"正文（Markdown，共 {len(content)} 字，显示前 {min(limit0, len(content))} 字）：")
+                print("")
+                print(content[:limit0])
+                if len(content) > limit0:
+                    print(f"\n…（还有 {len(content) - limit0} 字，需要的话加 --chars {min(8000, len(content))}）")
+                return
+            print("官方抓取没拿到正文，改试本地抽。")
+        except Exception as e:
+            print(f"官方抓取失败（{qqcap.clip(str(e), 80)}），改试本地抽。")
+
+    final, text = url, ""
+    title, body = "", ""
+    # 搜索结果的跳转链最多跟三层
+    for _ in range(3):
+        try:
+            final, text = fetch(final)
+        except Exception as e:
+            if not body:
+                qqcap.die(f"打不开这个链接：{qqcap.clip(str(e), 120)}")
+            break
+        title, body = extract(text)
+        if len(body) >= 200:
+            break
+        jump = find_jump(text)
+        if not jump or jump == final:
+            break
+        final = jump
+    if not body.strip():
+        print(f"标题：{title or '（无）'}")
+        print(f"地址：{final}")
+        print("\n正文抽不出来（多半是 JS 渲染的页面）。换一条结果试试，或者让对方发截图。")
+        return
+
+    limit = max(200, min(8000, args.chars))
+    clipped = body[:limit]
+    print(f"标题：{qqcap.clip(title, 120) or '（无）'}")
+    print(f"地址：{final}")
+    print(f"正文（{len(body)} 字，显示前 {len(clipped)} 字）：")
+    print("")
+    print(clipped)
+    if len(body) > limit:
+        print(f"\n…（还有 {len(body) - limit} 字没显示，需要的话加 --chars {min(8000, len(body))}）")
+
+
+if __name__ == "__main__":
+    main()

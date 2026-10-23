@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""必应搜索（免密钥）。用法: websearch "关键词" [条数]"""
+import sys
+import re
+import html
+import json
+import urllib.parse
+import urllib.request
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def fetch(url, timeout=15):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    for enc in ("utf-8", "gbk", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "ignore")
+
+
+def strip_tags(s):
+    s = re.sub(r"(?is)<(script|style).*?</\1>", " ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def bing(q, limit):
+    url = (
+        "https://cn.bing.com/search?q="
+        + urllib.parse.quote(q)
+        + "&setlang=zh-CN&mkt=zh-CN&count="
+        + str(limit)
+    )
+    page = fetch(url)
+    blocks = re.findall(r'(?is)<li class="b_algo".{0,4000}?</li>', page)
+    out = []
+    for b in blocks:
+        m = re.search(r'(?is)<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', b)
+        if not m:
+            continue
+        link, title = m.group(1), strip_tags(m.group(2))
+        if not title or not link.startswith("http"):
+            continue
+        p = re.search(r"(?is)<p[^>]*>(.*?)</p>", b)
+        snip = strip_tags(p.group(1)) if p else ""
+        out.append((title, link, snip))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def deepseek(q, limit):
+    """回落到 DeepSeek 官方搜索（需要 DEEPSEEK_API_KEY）。"""
+    import os
+
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        return []
+    body = json.dumps(
+        {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": q}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            "max_tokens": 800,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://api.deepseek.com/anthropic/v1/messages",
+        data=body,
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    d = json.load(urllib.request.urlopen(req, timeout=60))
+    text = " ".join(
+        c.get("text", "") for c in d.get("content", []) if c.get("type") == "text"
+    ).strip()
+    return [("DeepSeek 搜索结果", "", text)] if text else []
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法: websearch \"关键词\" [条数]", file=sys.stderr)
+        return 2
+    q = sys.argv[1]
+    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+
+    results = []
+    err = ""
+    try:
+        results = bing(q, limit)
+    except Exception as e:
+        err = str(e)
+
+    if not results and err:
+        try:
+            results = deepseek(q, limit)
+        except Exception:
+            pass
+
+    if not results:
+        print("没有搜到结果" + (f"（{err}）" if err else ""), file=sys.stderr)
+        return 1
+
+    for i, (title, link, snip) in enumerate(results, 1):
+        print(f"{i}. {title}")
+        if link:
+            print(f"   {link}")
+        if snip:
+            print(f"   {snip[:220]}")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"搜索失败: {e}", file=sys.stderr)
+        sys.exit(1)

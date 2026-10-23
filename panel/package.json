@@ -1,0 +1,14 @@
+{
+  "name": "qqbot-panel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness QQ bot control panel",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

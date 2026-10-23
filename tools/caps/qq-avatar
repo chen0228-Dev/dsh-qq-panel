@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""qq-avatar —— 给机器人换 QQ 头像。
+
+NapCat 的 set_qq_avatar 接受两种 file：`base64://...` 或 http(s) URL，
+本地路径不行（会报「file 字段可能格式不正确」）。
+
+用法：
+  qq-avatar /root/qq-workspace/downloads/xxx.jpg    本地图片
+  qq-avatar https://example.com/a.png               网络图片
+  qq-avatar --show                                  看当前头像地址
+"""
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+PANEL = "http://127.0.0.1:18080/api/qq/action"
+MAX_MB = 8
+
+
+def call(action, params=None, timeout=40000):
+    body = json.dumps({"action": action, "params": params or {}, "timeout": timeout}).encode()
+    req = urllib.request.Request(PANEL, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout / 1000 + 10) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        qqcap.die(f"调用失败：{e}")
+
+
+def pick_file(path):
+    """把本地文件转成 base64:// ，网络地址原样传。"""
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    if not os.path.exists(path):
+        qqcap.die(f"找不到文件：{path}")
+    size = os.path.getsize(path)
+    if size > MAX_MB * 1048576:
+        qqcap.die(f"图片 {size / 1048576:.1f} MB，超过 {MAX_MB} MB 上限")
+    with open(path, "rb") as f:
+        return "base64://" + base64.b64encode(f.read()).decode()
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--show", action="store_true", help="查看当前头像")
+    args = ap.parse_args()
+
+    qqcap.need("avatar")
+
+    if args.show:
+        d = call("get_login_info")
+        if not d.get("ok"):
+            qqcap.die(d.get("error") or "拿不到账号信息")
+        info = d.get("data") or {}
+        print(f"账号：{info.get('user_id')}（{info.get('nickname')}）")
+        print("头像地址需要从 QQ 资料页看，OneBot 接口不返回。")
+        return
+
+    if not args.file:
+        qqcap.die("给我一张图片的路径或网址")
+
+    payload = pick_file(args.file)
+    d = call("set_qq_avatar", {"file": payload})
+    if not d.get("ok"):
+        qqcap.die(d.get("error") or "设置失败")
+
+    print("头像已更换。")
+    if payload.startswith("base64://"):
+        print(f"（用的是本地文件 {args.file}，约 {os.path.getsize(args.file) / 1024:.0f} KB）")
+    else:
+        print(f"（用的是网络地址 {args.file}）")
+    print("QQ 客户端可能有几分钟缓存，让对方下拉刷新或重新进资料页再看。")
+
+
+if __name__ == "__main__":
+    main()

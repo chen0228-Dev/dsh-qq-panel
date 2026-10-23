@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""qq-pic —— 按关键词上网找一张图，下到本地，返回路径。
+
+为什么单独做一个：qq-search 给的是网页链接，qq-grab 只能下「已知的图」，
+中间缺一步「按关键词找图」。发说说配图、聊到某个东西顺手配张图，都要这一步。
+
+用法：
+  qq-pic "秋天的校园"                 下第一张能用的
+  qq-pic "傍晚 天空" --pick 2         换第二张候选
+  qq-pic "深夜 台灯" --list           只列候选链接，不下载
+  qq-pic "猫" -o /tmp/a.jpg           指定输出路径
+
+设计取舍：
+- 三家用搜索引擎兜底（Bing → 百度 → 搜狗），一家挂了换下一家；
+- 每张都校验魔数和大小，图标、防盗链占位图这类直接跳过；
+- 下载后用 ffmpeg 压到最长边 1440，因为配图要 base64 塞进说说接口，
+  原图动辄几 MB，压完通常只剩一两百 KB，成功率高得多；
+- 会尽量避开「人像」类结果 —— 说说配图放陌生人正脸很奇怪。
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+MIN_BYTES = 8 * 1024
+MAX_BYTES = 12 * 1024 * 1024
+MAX_EDGE = 1440
+
+# 明显是「人」的词，命中就跳过：说说配陌生人正脸很怪
+PERSON_WORDS = ("人像", "自拍", "美女", "帅哥", "头像", "模特", "网红", "明星")
+
+
+def magic_ext(b):
+    if b[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if b[:4] == b"GIF8":
+        return ".gif"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def bing_images(q, n):
+    """Bing 图片的 async 接口，返回 HTML 片段，每张图的信息在 m="{...}" 里。"""
+    url = (
+        "https://cn.bing.com/images/async?q="
+        + urllib.parse.quote(q)
+        + f"&first=0&count={max(10, n * 3)}&mkt=zh-CN&qft=+filterui:photo-photo"
+    )
+    status, page = qqcap.http_get(url, {"Accept-Language": "zh-CN,zh;q=0.9"}, timeout=20)
+    if status != 200:
+        return []
+    out = []
+    for m in re.finditer(r'm="(\{[^"]+?\})"', page):
+        raw = m.group(1).replace("&quot;", '"')
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        u = d.get("murl") or d.get("turl") or ""
+        if u.startswith("http"):
+            out.append({"url": u, "src": "bing", "title": (d.get("t") or "")[:40]})
+    return out
+
+
+def baidu_images(q, n):
+    url = (
+        "https://image.baidu.com/search/acjson?tn=resultjson_com&logid=0&ipn=rj&ct=201326592"
+        "&is=&fp=result&fr=&word=" + urllib.parse.quote(q) + f"&pn=0&rn={max(10, n * 3)}&gsm=1e"
+    )
+    status, txt = qqcap.http_get(url, {"Referer": "https://image.baidu.com/", "Accept": "*/*"}, timeout=20)
+    if status != 200:
+        return []
+    try:
+        d = json.loads(txt)
+    except Exception:
+        return []
+    out = []
+    for it in d.get("data") or []:
+        if not isinstance(it, dict):
+            continue
+        u = it.get("middleURL") or it.get("hoverURL") or it.get("thumbURL") or ""
+        if u.startswith("http"):
+            out.append({"url": u, "src": "百度", "title": (it.get("fromPageTitleEnc") or "")[:40]})
+    return out
+
+
+def sogou_images(q, n):
+    url = "https://pic.sogou.com/napi/pc/searchList?mode=1&start=0&xml_len=" + str(max(10, n * 3)) + "&query=" + urllib.parse.quote(q)
+    status, txt = qqcap.http_get(url, {"Referer": "https://pic.sogou.com/"}, timeout=20)
+    if status != 200:
+        return []
+    try:
+        d = json.loads(txt)
+    except Exception:
+        return []
+    out = []
+    for it in (d.get("data") or {}).get("items") or []:
+        u = it.get("picUrl") or it.get("oriPicUrl") or ""
+        if u.startswith("http"):
+            out.append({"url": u, "src": "搜狗", "title": (it.get("title") or "")[:40]})
+    return out
+
+
+def search(q, n):
+    """三家兜底，去重后按顺序返回。"""
+    seen = set()
+    out = []
+    for fn in (bing_images, baidu_images, sogou_images):
+        try:
+            got = fn(q, n)
+        except SystemExit:
+            raise
+        except Exception:
+            got = []
+        for it in got:
+            u = it["url"]
+            if u in seen:
+                continue
+            # 命中人像关键词的直接丢
+            if any(w in (it.get("title") or "") for w in PERSON_WORDS):
+                continue
+            seen.add(u)
+            out.append(it)
+        if len(out) >= n * 2:
+            break
+    return out
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": qqcap.UA, "Referer": "https://cn.bing.com/"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        data = r.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError("图太大")
+    if len(data) < MIN_BYTES:
+        raise ValueError("太小，多半是图标或占位图")
+    ext = magic_ext(data)
+    if not ext:
+        raise ValueError("不是图片")
+    return data, ext
+
+
+def shrink(path):
+    """尽量压到最长边 1440。没有 ffmpeg 就算了，不拦着用原图。"""
+    try:
+        if not subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0:
+            return
+        tmp = path + ".small.jpg"
+        r = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error", "-i", path,
+                "-vf", f"scale='min({MAX_EDGE},iw)':-2",
+                "-q:v", "3", tmp,
+            ],
+            capture_output=True,
+            timeout=40,
+        )
+        if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 4096:
+            os.replace(tmp, path)
+        else:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    except Exception:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("query", nargs="+")
+    ap.add_argument("-n", "--num", type=int, default=8, help="最多试几张")
+    ap.add_argument("--pick", type=int, default=1, help="从第几张开始试（1 起）")
+    ap.add_argument("--list", action="store_true", help="只列候选，不下载")
+    ap.add_argument(
+        "--sticker",
+        action="store_true",
+        help="按表情包找：自动补「表情包」关键词、一次下多张候选、存到临时目录",
+    )
+    ap.add_argument("-o", "--out", default="", help="指定输出路径")
+    args = ap.parse_args()
+
+    qqcap.need("download")
+    q = " ".join(args.query).strip()
+    if not q:
+        qqcap.die("给我一个关键词，比如「秋天的校园」")
+
+    # ---- 表情包模式 ----
+    # 为什么要单独一个模式：搜「无语」出来的多半是插画和摄影，不是表情包。
+    # 表情包得靠关键词补「表情包/沙雕/熊猫头」这类词，而且**一次要下好几张**——
+    # 哪张贴题必须看图才知道，工具没法替她判断。
+    if args.sticker:
+        want = max(1, min(6, args.num))
+        q2 = q if ("表情" in q or "沙雕" in q or "梗图" in q) else q + " 表情包"
+        cand = search(q2, max(8, want * 4))
+        if not cand:
+            print(f"[没有找到] 「{q2}」一张都没搜到。换个说法（「无语」「摆烂」「白眼」这种情绪词更好搜）。")
+            return 3
+
+        outdir = os.environ.get("QQ_STICKER_TMP", "/root/qq-workspace/downloads")
+        os.makedirs(outdir, exist_ok=True)
+        saved = []
+        for it in cand:
+            if len(saved) >= want:
+                break
+            try:
+                data, ext = fetch(it["url"])
+            except SystemExit:
+                raise
+            except Exception:
+                continue
+            path = os.path.join(outdir, "sticker-" + hashlib.md5(it["url"].encode()).hexdigest()[:10] + ext)
+            with open(path, "wb") as f:
+                f.write(data)
+            saved.append({"path": path, "src": it["src"], "title": it.get("title") or "", "kb": os.path.getsize(path) // 1024})
+
+        if not saved:
+            print(f"[没有找到] 「{q2}」搜到 {len(cand)} 张但一张都下不下来（多半是防盗链）。换个说法再试。")
+            return 3
+
+        print(f"[表情包候选] {len(saved)} 张。**先 read_image 看完，再挑最贴题的一张存库**：")
+        for i, x in enumerate(saved, 1):
+            print(f"  {i}. {x['path']}")
+            print(f"     {x['kb']} KB · 来源 {x['src']} · 「{qqcap.clip(x['title'], 24)}」")
+        print("存库（标签写情绪，别写「表情包」）：")
+        print(f'  qq-save-sticker "{saved[0]["path"]}" --tags "无语,挑眉" --desc "他说了什么离谱的话时扔出去"')
+        print("挑不出一张贴题的就不存 —— 宁可这次不发，也别往库里塞不像话的图。")
+        return 0
+
+    items = search(q, max(3, min(15, args.num)))
+    if not items:
+        print(f"[没有找到] 「{q}」一张都没搜到。换个更具体的词，或者干脆不配图。")
+        return 3
+
+    if args.list:
+        print(f"「{q}」候选 {len(items)} 张：")
+        for i, it in enumerate(items[: args.num], 1):
+            print(f"{i}. [{it['src']}] {qqcap.clip(it['title'], 30)}")
+            print(f"   {it['url']}")
+        return 0
+
+    start = max(1, args.pick) - 1
+    tried = 0
+    for it in items[start : start + args.num]:
+        tried += 1
+        try:
+            data, ext = fetch(it["url"])
+        except SystemExit:
+            raise
+        except Exception as e:
+            last = e
+            continue
+        out = args.out or os.path.join(
+            os.environ.get("QQ_PIC_DIR", "/root/qq-workspace/qzone"),
+            "pic-" + hashlib.md5(it["url"].encode()).hexdigest()[:10] + ext,
+        )
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(data)
+        before = len(data)
+        shrink(out)
+        after = os.path.getsize(out)
+        print(f"[配图] {out}")
+        print(f"       {after // 1024} KB（原 {before // 1024} KB）· 来源 {it['src']} · 「{qqcap.clip(it['title'], 24) or q}」")
+        print("       发说说时用：qq-zone \"正文\" --image " + out)
+        if tried > 1:
+            print(f"       （第 {start + tried} 个候选才成功，前面的下不下来）")
+        return 0
+
+    print(f"[没有找到] 「{q}」试了 {tried} 张都下不下来（多半是防盗链）。换个词，或者说不配图。")
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

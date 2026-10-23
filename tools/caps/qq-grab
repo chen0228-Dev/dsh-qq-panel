@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""qq-grab —— 下载网络图片/文件到本地，方便再发出去或看图。
+
+用法：
+  qq-grab https://example.com/a.jpg              存到工作区，自动起名
+  qq-grab https://example.com/a.jpg -o /tmp/x.jpg
+  qq-grab <url> --max-mb 25                      超过大小就拒绝
+"""
+import argparse
+import hashlib
+import mimetypes
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+WORK = "/root/qq-workspace/downloads"
+
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+
+def guess_name(url, ctype):
+    path = urllib.parse.urlparse(url).path
+    base = os.path.basename(path) or ""
+    base = re.sub(r"[^\w.\-\u4e00-\u9fa5]", "_", base)[:60]
+    if not base or "." not in base:
+        ext = mimetypes.guess_extension((ctype or "").split(";")[0].strip()) or ".bin"
+        base = hashlib.md5(url.encode()).hexdigest()[:10] + ext
+    if not os.path.splitext(base)[1]:
+        base += mimetypes.guess_extension((ctype or "").split(";")[0].strip()) or ".bin"
+    return base
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("url")
+    ap.add_argument("-o", "--out", default="")
+    ap.add_argument("--max-mb", type=float, default=25.0)
+    args = ap.parse_args()
+
+    qqcap.need("download")
+    url = args.url.strip()
+    if not url.startswith("http"):
+        qqcap.die("给我一个 http(s) 链接")
+
+    os.makedirs(WORK, exist_ok=True)
+    tmp = os.path.join(WORK, ".dl-" + str(os.getpid()))
+
+    r = subprocess.run(
+        [
+            "curl",
+            "-sL",
+            "-m",
+            "90",
+            "-A",
+            qqcap.UA,
+            "-e",
+            urllib.parse.urlparse(url).scheme + "://" + urllib.parse.urlparse(url).netloc,
+            "-D",
+            tmp + ".hdr",
+            "-o",
+            tmp,
+            url,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0 or not os.path.exists(tmp):
+        qqcap.die("下载失败：" + (r.stderr or "")[:200])
+
+    size = os.path.getsize(tmp)
+    if size == 0:
+        os.unlink(tmp)
+        qqcap.die("下载到 0 字节，链接可能失效或需要登录")
+
+    ctype = ""
+    try:
+        head = open(tmp + ".hdr", "r", errors="ignore").read()
+        m = re.search(r"(?i)^content-type:\s*([^\r\n]+)", head, re.M)
+        if m:
+            ctype = m.group(1).strip()
+    except OSError:
+        pass
+
+    if size > args.max_mb * 1048576:
+        os.unlink(tmp)
+        qqcap.die(f"文件 {size / 1048576:.1f} MB，超过上限 {args.max_mb} MB")
+
+    dst = args.out or os.path.join(WORK, guess_name(url, ctype))
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    os.replace(tmp, dst)
+    for leftover in (tmp + ".hdr",):
+        try:
+            os.unlink(leftover)
+        except OSError:
+            pass
+
+    ext = os.path.splitext(dst)[1].lower()
+    kind = "图片" if ext in IMAGE_EXT else "文件"
+    print(f"已保存{kind}：{dst}")
+    print(f"大小：{size / 1024:.0f} KB · 类型：{ctype or '未知'}")
+    if ext in IMAGE_EXT:
+        print("可以直接 qq_send_image 发出去，或者 read_image 看一眼内容。")
+
+
+if __name__ == "__main__":
+    main()

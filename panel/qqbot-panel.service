@@ -1,0 +1,20 @@
+[Unit]
+Description=QQ Bot Control Panel (dsh + NapCat)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qqbot/panel
+ExecStart=/usr/bin/node /opt/qqbot/panel/server.js
+Restart=always
+RestartSec=3
+Environment=PANEL_PORT=18080
+Environment=PANEL_BIND=0.0.0.0
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qqbot-panel
+
+[Install]
+WantedBy=multi-user.target

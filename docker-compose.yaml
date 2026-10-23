@@ -1,0 +1,23 @@
+# NapCat 协议端（OneBot 11）
+# 启动：docker compose up -d
+# 网络：host 模式，容器直接占用宿主机 6099(WebUI) / 3000(HTTP) / 3001(WS)
+# 安全：安全组只放行 22，所有端口通过 SSH 隧道访问
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    network_mode: host
+    environment:
+      - WEBUI_TOKEN=${WEBUI_TOKEN:?请在 .env 里设置 WEBUI_TOKEN}
+      - TZ=Asia/Shanghai
+      - NAPCAT_UID=0
+      - NAPCAT_GID=0
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/qq:/app/.config/QQ
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

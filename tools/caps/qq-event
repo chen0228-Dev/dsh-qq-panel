@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""qq-event —— 往「她自己的活动池」里加一件事。
+
+为什么要这个工具：
+她的日常活动原来只有模板里那十来条（打球、逛街、看电影），一年三百六十五天
+翻来覆去就这几件，久了就是个循环播放的录音。可她是个活人 —— 会突然想学吉他、
+会因为朋友约了去爬山、会开始每周三去上陶艺课。
+这个命令就是让她把这些念头**真的记下来**：记进去的活动会进每天抽签的池子，
+哪天就真的抽到「在学吉他」。她的日子会慢慢跟别人不一样，因为她自己往里放过东西。
+
+写的是 ${PANEL_DATA}/campus-extra.json（PANEL_DATA 默认 /opt/qqbot/panel/data）：
+  {"events": [{"label": "学吉他", "from": "19:30", "to": "21:00",
+               "busy": 1, "line": "在练吉他，手指按得有点疼",
+               "focus": false, "addedAt": 1792000000000}]}
+
+【为什么单独一个文件，不写进 config.json】
+config 里的 routine 会被「套用模板」和「让她自己重排一天」整个覆盖，
+换职业时也会被清掉 —— 她的积累会一次全没。独立文件跟着她走。
+
+用法：
+  qq-event add "学吉他"                      不给时间就自动挑一个不冲突的空档
+  qq-event add "去爬山" --from 09:00 --to 12:00 --busy 1
+  qq-event add "上陶艺课" --from 14:00 --to 16:00 --line "在捏陶，手上全是泥"
+  qq-event add "看电影" --focus                --focus 表示这件事不方便看手机
+  qq-event list                              她攒了哪些
+  qq-event remove "学吉他"
+  qq-event clear
+
+上限 30 条，超了淘汰最早加的（活动池无限长会让「每天抽到不一样的」越来越难）。
+同名活动再加一次是覆盖，不会叠两条。
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap  # noqa: E402
+
+DATA_DIR = os.environ.get("PANEL_DATA", "/opt/qqbot/panel/data")
+FILE = os.path.join(DATA_DIR, "campus-extra.json")
+CONFIG = os.path.join(DATA_DIR, "config.json")
+
+EXTRA_MAX = 30
+SLOT_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+BUSY_NAMES = {0: "闲", 1: "有点忙", 2: "正忙", 3: "睡了"}
+
+
+def to_min(hhmm):
+    """'19:00' → 1140；脏数据返回 None。"""
+    try:
+        h, m = str(hhmm).split(":")
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except Exception:
+        pass
+    return None
+
+
+def norm_time(text, what):
+    """校验并归一化 HH:MM。"""
+    t = str(text or "").strip()
+    m = SLOT_RE.match(t)
+    if not m:
+        qqcap.die(f'{what}要写成 "19:30" 这样，你给的是 "{t}"')
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        qqcap.die(f"没有这个时间：{t}（小时 0-23，分钟 0-59）")
+    return f"{h:02d}:{mi:02d}"
+
+
+def load_extra():
+    try:
+        with open(FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        evs = d.get("events")
+        return [x for x in evs if isinstance(x, dict) and x.get("label")] if isinstance(evs, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
+def load_base_events():
+    """模板活动池（如果 config 里存了 routine）。读不到就当空。"""
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+        r = (cfg.get("campus") or {}).get("routine") or {}
+        evs = r.get("events")
+        return [x for x in evs if isinstance(x, dict)] if isinstance(evs, list) else []
+    except Exception:
+        return []
+
+
+def save_extra(events):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"events": events}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, FILE)
+
+
+def pick_slot(extra, base, prefer=""):
+    """挑一个不跟现有活动撞的时间段（和 campus.js 的 pickFreeSlot 同逻辑）。
+
+    返回 (from, to)；实在挤不下返回 (None, None) —— 宁可这次不加，
+    也不要塞一个跟别人重叠的进去（重叠的活动抽签时只能选一个，等于白加）。
+    """
+    used = []
+    for e in list(base) + list(extra):
+        a, b = to_min(e.get("from")), to_min(e.get("to"))
+        if a is not None and b is not None:
+            used.append((a, b))
+
+    def free(a, b):
+        return not any(a < y and b > x for x, y in used)
+
+    if re.search(r"早|上午", prefer):
+        anchor = 9 * 60
+    elif "下午" in prefer:
+        anchor = 14 * 60
+    else:
+        anchor = 19 * 60
+
+    starts = []
+    starts += list(range(anchor, 21 * 60 + 1, 30))
+    starts += list(range(anchor - 30, 8 * 60 - 1, -30))
+    starts += list(range(8 * 60, 21 * 60 + 1, 30))
+    uniq = list(dict.fromkeys(starts))
+
+    # 先试 90 分钟，塞不下就压到 60/45/30 ——
+    # 模板活动很密时（下午晚上全占满），只认 90 分钟会一条都加不进去
+    for length in (90, 60, 45, 30):
+        for s in uniq:
+            if s + length > 23 * 60:
+                continue
+            if free(s, s + length):
+                return (f"{s // 60:02d}:{s % 60:02d}",
+                        f"{(s + length) // 60:02d}:{(s + length) % 60:02d}")
+    return None, None
+
+
+def cmd_add(args):
+    label = (args.label or "").strip()
+    if not label:
+        qqcap.die("要加什么活动？比如 qq-event add \"学吉他\"")
+    if len(label) > 12:
+        qqcap.die(f"活动名太长了（{len(label)} 字），写短一点，像「学吉他」「去爬山」")
+    if len(label) < 2:
+        qqcap.die(f"活动名太短了（「{label}」），说清楚是去干嘛")
+
+    extra = load_extra()
+    base = load_base_events()
+
+    # 只给一半时间不算「指定了时间」，必须两个一起给 ——
+    # 否则用户以为限定了时间，实际走了自动排空档，参数被静默忽略
+    if args.start or args.end:
+        if not (args.start and args.end):
+            qqcap.die("--from 和 --to 要一起给，比如 --from 19:30 --to 21:00")
+        f = norm_time(args.start, "--from")
+        t = norm_time(args.end, "--to")
+        if to_min(t) <= to_min(f):
+            qqcap.die(f'结束时间要晚于开始时间（你给的是 {f}-{t}）')
+    else:
+        f, t = pick_slot(extra, base, label)
+        if not f:
+            qqcap.die(
+                "活动池已经排满了，这天塞不下新活动了。"
+                "先用 qq-event list 看看有什么、qq-event remove 删掉几条不想要的"
+            )
+        print(f"[自动排时] {f}-{t}（挑了个不冲突的空档，想改就带 --from/--to）")
+
+    busy = args.busy
+    if not (0 <= busy <= 3):
+        qqcap.die(f"--busy 只能是 0/1/2/3（0 闲 1 有点忙 2 正忙 3 睡了），你给的是 \"{busy}\"")
+
+    # 「去爬山」→ 默认说成「你在爬山」，别拼成「在去爬山」
+    bare = label[1:] if label.startswith("去") and len(label) > 1 else label
+    line = (args.line or "").strip() or f"你在{bare}，这事是你自己找的，做得挺投入"
+    entry = {
+        "label": label,
+        "from": f,
+        "to": t,
+        "busy": busy,
+        "line": line,
+        "focus": bool(args.focus),
+        "addedAt": int(datetime.datetime.now().timestamp() * 1000),
+    }
+
+    idx = next((i for i, x in enumerate(extra) if x.get("label") == label), None)
+    if idx is not None:
+        extra.pop(idx)
+        print(f"[已更新] 「{label}」原来就有，改用新的时间")
+    extra.append(entry)
+
+    # 超上限淘汰最早加的
+    dropped = None
+    if len(extra) > EXTRA_MAX:
+        extra.sort(key=lambda x: x.get("addedAt") or 0)
+        dropped = extra.pop(0)
+        extra.sort(key=lambda x: to_min(x.get("from")) or 0)
+
+    save_extra(extra)
+
+    print(f"[已加入] {f}-{t} {label}（busy {busy} {BUSY_NAMES.get(busy, '')}）")
+    if dropped:
+        print(f"[腾位置] 池子上限 {EXTRA_MAX} 条，先撤掉最早加的「{dropped.get('label')}」")
+    print("以后哪天可能真的抽到这件事。你的日子会慢慢跟以前不一样。")
+
+
+def cmd_list(args):
+    evs = load_extra()
+    if not evs:
+        print("[空] 你还没往活动池里加过东西。想到什么就 qq-event add \"想做的事\"")
+        return
+    evs_sorted = sorted(evs, key=lambda x: to_min(x.get("from")) or 0)
+    print(f"你自己加的活动（{len(evs)}/{EXTRA_MAX} 条）：")
+    for i, e in enumerate(evs_sorted, 1):
+        tag = " ·不能分心" if e.get("focus") else ""
+        print(f"  {i}. [{e.get('from')}-{e.get('to')}] {e.get('label')}"
+              f"（busy {e.get('busy')}{tag}）")
+        if e.get("line"):
+            print(f"     {e.get('line')}")
+
+
+def cmd_remove(args):
+    label = (args.label or "").strip()
+    extra = load_extra()
+    left = [x for x in extra if x.get("label") != label]
+    if len(left) == len(extra):
+        qqcap.die(f"没找到「{label}」。用 qq-event list 看看有哪些")
+    save_extra(left)
+    print(f"[已删掉] 「{label}」以后不会再出现了")
+
+
+def cmd_clear(args):
+    n = len(load_extra())
+    save_extra([])
+    print(f"[已清空] 你自己加的 {n} 条活动都不要了，回到模板那些")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="qq-event", add_help=True)
+    sub = ap.add_subparsers(dest="cmd")
+
+    a = sub.add_parser("add", help="加一件你想做的事")
+    a.add_argument("label")
+    a.add_argument("--from", dest="start", default="")
+    a.add_argument("--to", dest="end", default="")
+    a.add_argument("--busy", type=int, default=1)
+    a.add_argument("--line", default="")
+    a.add_argument("--focus", action="store_true", help="这件事不方便看手机")
+    a.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("set", help="跟 add 一样")
+    s.add_argument("label")
+    s.add_argument("--from", dest="start", default="")
+    s.add_argument("--to", dest="end", default="")
+    s.add_argument("--busy", type=int, default=1)
+    s.add_argument("--line", default="")
+    s.add_argument("--focus", action="store_true")
+    s.set_defaults(func=cmd_add)
+
+    li = sub.add_parser("list", help="看看你自己加了什么")
+    li.set_defaults(func=cmd_list)
+
+    r = sub.add_parser("remove", help="删掉一条")
+    r.add_argument("label")
+    r.set_defaults(func=cmd_remove)
+
+    c = sub.add_parser("clear", help="全部清空")
+    c.set_defaults(func=cmd_clear)
+
+    args = ap.parse_args()
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return
+    qqcap.need("events")
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

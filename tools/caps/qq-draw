@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""qq-draw —— 按一句话描述生成一张图，返回本地路径。
+
+用法：
+  qq-draw "一只橘猫坐在窗台上看雨，简笔画"      生成并打印图片路径
+  qq-draw "赛博朋克校园夜景" --size 1024x1536    指定尺寸
+  qq-draw "..." -o /root/qq-workspace/cat.png   指定输出位置
+
+设计取舍：
+- **不直连第三方生图接口**，只打面板的本机接口（127.0.0.1:18080）。
+  API key 只存在面板配置里，这个脚本看不到、也不需要 —— 工具被翻出来
+  贴给别人看，也不会连带泄露 key。
+- 鉴权用 `panel/data/internal.token`（0600），不是「本机免登录」：
+  同一个 token 还能挡住机器上其它低权限进程随手烧生图额度。
+- 生成要十几秒到一分钟，超时给 120 秒；超时直接报错，不重试 ——
+  重试等于再花一次钱，而且大概率还是超时。
+- 只打印路径，不发图。发不发、配什么话，交给调用方（qq_send_image）。
+
+能力开关在面板「模型 → 启用生图」。关掉后这里会拿到 500 + 明确原因。
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+PANEL = os.environ.get("QQPANEL_URL", "http://127.0.0.1:18080")
+TOKEN_FILE = os.environ.get("QQPANEL_TOKEN_FILE", "/opt/qqbot/panel/data/internal.token")
+
+
+def die(msg, code=1):
+    print(f"qq-draw: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def token():
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            t = f.read().strip()
+    except OSError as e:
+        die(f"读不到面板内部令牌（{TOKEN_FILE}）：{e}")
+    if len(t) < 32:
+        die("面板内部令牌异常，重启面板会重新生成")
+    return t
+
+
+def draw(prompt, size=None):
+    body = {"prompt": prompt}
+    if size:
+        body["size"] = size
+    req = urllib.request.Request(
+        PANEL + "/api/imagegen/generate",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Panel-Token": token(),
+        },
+        method="POST",
+    )
+    try:
+        # 生图本身 90 秒超时，这里再宽一点，留给排队和回传
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            j = json.loads(raw)
+            die(j.get("error") or f"HTTP {e.code}")
+        except json.JSONDecodeError:
+            die(f"HTTP {e.code}: {raw[:200]}")
+    except urllib.error.URLError as e:
+        die(f"连不上面板（{PANEL}）：{e.reason}")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("prompt", nargs="+", help="想画什么")
+    ap.add_argument("--size", default=None, help="1024x1024 / 1024x1536 / 1536x1024")
+    ap.add_argument("-o", "--out", default=None, help="另存到这个路径")
+    a = ap.parse_args()
+
+    prompt = " ".join(a.prompt).strip()
+    if not prompt:
+        die("描述不能为空")
+
+    res = draw(prompt, a.size)
+    if not res.get("ok"):
+        die(res.get("error") or "生图失败")
+    src = res.get("file")
+    if not src or not os.path.exists(src):
+        die("接口说成功了，但拿不到图片文件")
+
+    if a.out:
+        import shutil
+
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
+        shutil.copy2(src, a.out)
+        src = os.path.abspath(a.out)
+
+    # 只打印路径：调用方拿这一行去 qq_send_image 就行
+    print(src)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+# dsh web profile patch layer
+# 插件包自带 insert（bundle patch 自动加载），这里只做 config 覆盖
+
+- id: dsh-onebot
+  config:
+    mode: reverse
+    host: 127.0.0.1
+    port: 8643
+    accessToken: '__ONEBOT_TOKEN__'
+    requireMention: true
+    dmPolicy: open
+    groupPolicy: disabled
+    allowAllUsers: true
+    workspacePath: /path/to/qq-workspace

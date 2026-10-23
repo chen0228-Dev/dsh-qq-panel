@@ -1,0 +1,32 @@
+#!/bin/bash
+# qq-zone —— 发一条 QQ 空间说说
+# 用法：qq-zone "说说正文"
+set -u
+
+CONTENT="${1:-}"
+if [ -z "$CONTENT" ]; then
+  echo "用法: qq-zone \"说说正文\"" >&2
+  exit 1
+fi
+
+BODY=$(CONTENT="$CONTENT" python3 -c '
+import json, os
+print(json.dumps({
+    "action": "send_qzone_msg",
+    "params": {"content": os.environ["CONTENT"], "images": [], "ugc_right": 1, "target_uins": []}
+}, ensure_ascii=False))
+')
+
+RESP=$(curl -s -m 30 -X POST -H "Content-Type: application/json" -d "$BODY" \
+  http://127.0.0.1:18080/api/qq/action)
+
+echo "$RESP"
+
+echo "$RESP" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("ok") else 4)
+'

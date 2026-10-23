@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""qq-hear —— 听一段音频/语音，转成文字；可以顺带猜是什么歌。
+
+用法：
+  qq-hear /path/to/audio.mp3           只转写成文字
+  qq-hear /path/to/audio.mp3 --guess   转写后拿歌词去匹配曲库，猜歌名
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+MODEL = "/usr/local/share/whisper.cpp/models/ggml-base.bin"
+WHISPER = "/usr/local/bin/whisper-cli"
+HDR = {"Referer": "https://music.163.com", "Accept": "application/json"}
+
+
+def to_wav(src):
+    """whisper.cpp 只吃 16k 单声道 wav，先转一道。"""
+    dst = os.path.join(tempfile.gettempdir(), f"hear-{os.getpid()}.wav")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", dst],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if r.returncode != 0 or not os.path.exists(dst):
+        qqcap.die("音频转码失败：" + (r.stderr or "")[:200])
+    return dst
+
+
+def transcribe(wav):
+    r = subprocess.run(
+        [WHISPER, "-m", MODEL, "-f", wav, "-l", "zh", "-nt", "--prompt", "以下是简体中文普通话的聊天内容。"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if r.returncode != 0:
+        qqcap.die("识别失败：" + (r.stderr or "")[:200])
+    text = re.sub(r"\s+", "", r.stdout or "")
+    return text.strip()
+
+
+def guess_song(fragment):
+    """拿转写出来的歌词片段去曲库反查。
+
+    whisper base 对唱歌的识别会有错字（童年→同年、荡秋千→当秋迁），
+    所以不能要求精确包含，改成「滑窗 + 允许少量错字」的模糊匹配。
+    """
+    if len(fragment) < 5:
+        return []
+    probe = fragment[:16]
+    url = (
+        "https://music.163.com/api/search/get/web?s="
+        + urllib.parse.quote(probe)
+        + "&type=1&limit=6&offset=0"
+    )
+    status, text = qqcap.http_get(url, HDR)
+    if status != 200:
+        return []
+    import json
+
+    try:
+        songs = ((json.loads(text).get("result") or {}).get("songs")) or []
+    except Exception:
+        return []
+
+    from difflib import get_close_matches
+
+    hits = []
+    for s in songs[:6]:
+        sid = s.get("id")
+        st, raw = qqcap.http_get(
+            f"https://music.163.com/api/song/lyric?id={sid}&lv=1&kv=1&tv=-1", HDR, timeout=12
+        )
+        if st != 200:
+            continue
+        try:
+            lrc = ((json.loads(raw).get("lrc") or {}).get("lyric")) or ""
+        except Exception:
+            continue
+        clean = re.sub(r"\[[^\]]*\]", "", lrc)
+        clean = re.sub(r"\s+", "", clean)
+        if len(clean) < 8:
+            continue
+
+        score = 0
+        # 曲库里按 6 字开窗，和转写片段的每个 6 字窗口比
+        windows = [clean[i : i + 6] for i in range(0, max(1, len(clean) - 5), 2)]
+        for i in range(0, max(1, len(fragment) - 5), 1):
+            piece = fragment[i : i + 6]
+            if len(piece) < 6:
+                break
+            if piece in clean:
+                score = max(score, 10)
+                continue
+            near = get_close_matches(piece, windows, n=1, cutoff=0.84)
+            if near:
+                score = max(score, 6)
+
+        if score >= 6:
+            artists = " / ".join(a.get("name", "") for a in (s.get("artists") or []))
+            hits.append((score, s.get("name"), artists, sid))
+    hits.sort(reverse=True)
+    return hits[:3]
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("file")
+    ap.add_argument("--guess", action="store_true", help="顺带猜歌名")
+    args = ap.parse_args()
+
+    qqcap.need("hear")
+    if not os.path.exists(args.file):
+        qqcap.die(f"找不到文件：{args.file}")
+
+    wav = to_wav(args.file)
+    try:
+        text = transcribe(wav)
+    finally:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+
+    if not text:
+        print("这段音频里没听出清楚的说话声（也可能只是旋律）。")
+        return
+
+    print(f"听到的内容：{text}")
+
+    if args.guess:
+        hits = guess_song(text)
+        if hits:
+            print("\n歌词对上了，可能是：")
+            for score, name, artists, sid in hits:
+                mark = "歌词精确对上" if score >= 10 else "歌词大致对上（可能有听错）"
+                print(f"  · 《{name}》{'— ' + artists if artists else ''}（{mark}，id={sid}）")
+            print("想了解这首歌可以再跑 qq-music --id <上面的 id> -l -c")
+        else:
+            print("\n曲库歌词里没对上，可能就是随口说的，不是歌词。")
+
+
+if __name__ == "__main__":
+    main()

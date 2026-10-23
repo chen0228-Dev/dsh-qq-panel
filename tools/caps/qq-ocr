@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""qq-ocr —— 把图片里的文字提取出来（tesseract）。
+
+用 tsv 输出拿每个词的置信度，低置信度的直接丢掉 ——
+否则没有文字的图片（表情包、照片）会被 tesseract 硬凑出一堆乱码。
+
+**为什么要预处理**：直接怼原图，手机截图（深色背景 + 小字）和表情包（艺术字）
+经常一个字都识别不出来。实测同一张聊天截图，原图 0 字，处理过之后能读出整段。
+所以这里会换几种预处理各试一遍，取字数最多的那份：
+
+1. 灰度 + 2× 放大（小字太小，放大对 tesseract 帮助最大）
+2. 同上去反色（深色主题截图必须反色，否则是「白字白底」）
+3. 灰色 + 提高对比度（浅色背景、淡字）
+
+用法：
+  qq-ocr /path/to/image.jpg
+  qq-ocr /path/to/image.jpg --lang eng      只认英文（更快）
+  qq-ocr /path/to/image.jpg --conf 75       置信度门槛更高（默认 60）
+  qq-ocr /path/to/image.jpg --psm 11        直接指定布局模式，跳过自动尝试
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+
+def has_lang(name):
+    try:
+        r = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return name in (r.stdout or "").split()
+
+
+def parse_tsv(raw, min_conf):
+    """tesseract 的 tsv 每行一个词，第 11 列是置信度、第 12 列是文字。"""
+    rows = defaultdict(list)
+    for line in (raw or "").splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) < 12:
+            continue
+        try:
+            line_no = int(parts[4])
+            conf = float(parts[10])
+        except ValueError:
+            continue
+        word = parts[11].strip()
+        if word and conf >= min_conf:
+            rows[line_no].append(word)
+    return [" ".join(v) for _, v in sorted(rows.items()) if v]
+
+
+def useful_chars(lines):
+    return sum(1 for ln in lines for c in ln if c.isalnum() or "\u4e00" <= c <= "\u9fff")
+
+
+def clean_lines(lines):
+    """行级过滤：纯符号行（| ¢ 之类）在表情包/照片上很常见。"""
+    kept = []
+    for ln in lines:
+        chars = [c for c in ln if not c.isspace()]
+        alnum = [c for c in chars if c.isalnum() or "\u4e00" <= c <= "\u9fff"]
+        if chars and len(alnum) / len(chars) >= 0.5 and len(alnum) >= 2:
+            kept.append(ln)
+    return kept
+
+
+def ocr_once(img, lang, psm, conf):
+    try:
+        r = subprocess.run(
+            ["tesseract", img, "stdout", "-l", lang, "--psm", str(psm), "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    return clean_lines(parse_tsv(r.stdout, conf))
+
+
+def prepare(src, dst, mode):
+    """用 ffmpeg 做几种预处理。失败就返回 False（不影响主流程）。"""
+    if not shutil.which("ffmpeg"):
+        return False
+    vf = {
+        "gray2": "scale=2*iw:-2,format=gray",
+        "gray2_inv": "scale=2*iw:-2,format=gray,negate",
+        "gray2_hi": "scale=2*iw:-2,format=gray,eq=contrast=1.6",
+    }.get(mode)
+    if not vf:
+        return False
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vf", vf, dst],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 512
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("file")
+    ap.add_argument("--lang", default="")
+    ap.add_argument("--conf", type=float, default=60)
+    ap.add_argument("--psm", type=int, default=0, help="指定布局模式；0 = 自动多试几种")
+    args = ap.parse_args()
+
+    qqcap.need("ocr")
+    if not os.path.exists(args.file):
+        qqcap.die(f"找不到文件：{args.file}")
+    if not shutil.which("tesseract"):
+        # 直说不绕弯：让模型别在这里反复重试，换 read_image 更快
+        qqcap.die("这台机器没装 tesseract，认不了字。直接用 read_image 看图。")
+
+    lang = args.lang or ("chi_sim+eng" if has_lang("chi_sim") else "eng")
+    best, best_from = [], "原图"
+
+    # 用户点名了 psm 就只跑原图那一次，别自作主张
+    if args.psm:
+        best = ocr_once(args.file, lang, args.psm, args.conf)
+        best_from = f"原图 psm={args.psm}"
+    else:
+        # 先试原图（干净截图往往一次就够），不够再上预处理
+        best = ocr_once(args.file, lang, 6, args.conf)
+        if useful_chars(best) >= 12:
+            best_from = "原图"
+        else:
+            tmpdir = tempfile.mkdtemp(prefix="ocr_")
+            for mode in ("gray2", "gray2_inv", "gray2_hi"):
+                dst = os.path.join(tmpdir, mode + ".png")
+                if not prepare(args.file, dst, mode):
+                    continue
+                got = ocr_once(dst, lang, 6, args.conf)
+                if useful_chars(got) > useful_chars(best):
+                    best, best_from = got, mode
+                # 够用了就别再浪费时间；反色是深色截图的关键，哪怕字数差不多也优先
+                if useful_chars(got) >= 12 and mode in ("gray2", "gray2_inv"):
+                    break
+
+    if useful_chars(best) < 6:
+        print("这张图里没有可读的文字（画面、照片，或者字太小/太艺术化）。")
+        if best:
+            print("（勉强认出这些，参考一下：" + " / ".join(best[:3])[:80] + "）")
+        print("")
+        print("**别再试第二次了** —— 直接用 read_image 看这张图，你能看懂画面，比 OCR 强。")
+        return
+
+    print(f"图片里的文字（{lang}，置信度 ≥ {int(args.conf)}，来源：{best_from}）：")
+    print("\n".join(best))
+    if not has_lang("chi_sim"):
+        print("\n提示：没装中文语言包，只认了英文。")
+
+
+if __name__ == "__main__":
+    main()

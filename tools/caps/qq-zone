@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""qq-zone —— 发一条 QQ 空间说说。
+
+用法：
+  qq-zone "说说正文"
+  qq-zone "说说正文" --image /root/qq-workspace/stickers/xxx.png
+  qq-zone "说说正文" --image a.png --image b.png     最多 9 张
+  qq-zone "说说正文" --right 4                       4=好友可见
+
+配图为什么用 base64：NapCat 跑在容器里，看不到宿主机的 /root，
+传路径进去它读不到。所以这里自己读文件、转成 base64:// 再塞进请求体。
+带图失败会自动退回「纯文字再发一次」—— 宁可少张图，也不能整条说说没发出去。
+"""
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.request
+
+API = "http://127.0.0.1:18080/api/qq/action"
+MAX_IMAGES = 9
+MAX_BYTES = 8 * 1024 * 1024
+
+
+def post(content, images, right):
+    body = json.dumps(
+        {
+            "action": "send_qzone_msg",
+            "params": {
+                "content": content,
+                "images": images,
+                "ugc_right": right,
+                "target_uins": [],
+            },
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(API, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def to_b64(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError("文件不存在")
+    size = os.path.getsize(path)
+    if size > MAX_BYTES:
+        raise ValueError(f"图太大 {size // 1024} KB")
+    with open(path, "rb") as f:
+        return "base64://" + base64.b64encode(f.read()).decode()
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("content", nargs="+", help="说说正文")
+    ap.add_argument("--image", action="append", default=[], help="配图路径，可重复")
+    ap.add_argument("--right", default="1", help="1 所有人 / 4 好友 / 64 仅自己")
+    args = ap.parse_args()
+
+    content = " ".join(args.content).strip()
+    if not content:
+        print("[错误] 说说正文是空的")
+        return 1
+    if len(content) > 1000:
+        print(f"[错误] 正文太长（{len(content)} 字），说说上限大约一千字")
+        return 1
+
+    images = []
+    skipped = []
+    for p in args.image[:MAX_IMAGES]:
+        try:
+            images.append(to_b64(p))
+        except Exception as e:
+            skipped.append(f"{os.path.basename(p)}（{e}）")
+
+    right = int(args.right) if str(args.right).isdigit() else 1
+
+    try:
+        r = post(content, images, right)
+    except Exception as e:
+        print(f"[错误] 请求失败：{e}")
+        return 4
+
+    if not r.get("ok") and images:
+        # 图上传这条链路最容易出问题，但「说说没发出去」比「少张配图」严重得多
+        why = str(r.get("error") or r.get("message") or "未知")[:60]
+        print(f"[提示] 带图没发出去（{why}），改成纯文字重试")
+        try:
+            r = post(content, [], right)
+            images = []
+        except Exception as e:
+            print(f"[错误] 重试也失败：{e}")
+            return 4
+
+    if not r.get("ok"):
+        print(f"[错误] 发送失败：{r.get('error') or r.get('message') or r}")
+        return 4
+
+    tid = ""
+    d = r.get("data")
+    if isinstance(d, dict):
+        tid = d.get("tid") or d.get("Tid") or ""
+    n = len(images)
+    print(f"[已发] {len(content)} 字" + (f"，配图 {n} 张" if n else "，纯文字") + (f"，tid={tid}" if tid else ""))
+    if skipped:
+        print("（这些图没带上：" + "、".join(skipped) + "）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

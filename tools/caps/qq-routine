@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""qq-routine —— 改「我现在在干嘛」。
+
+为什么要有这个工具：
+她身上挂着一台状态机（panel/lib/campus.js），状态决定了她回消息多快、
+语气什么温度。可那台状态机只会按模板推日程，不知道「她刚才在对话里答应了
+去打篮球」。于是就会出现最难圆的那种破绽：十分钟前说「我去打球了」，
+十分钟后还在回「在宿舍躺着」。
+所以 —— 她说完、或者答应了对方要去做某件事，就用这个命令把状态钉进去。
+写完立刻生效：campus.js 是按文件 mtime 读的，不用重启、不用碰 config。
+
+写的是 ${PANEL_DATA}/campus-plan.json（PANEL_DATA 默认 /opt/qqbot/panel/data）：
+  {"date": "2026-10-22",
+   "items": [{"from": "19:00", "to": "20:30", "label": "打篮球", "busy": 1,
+              "line": "在球场打球，出了一身汗，手机扔在场边"}]}
+campus.js 只在 date 等于今天时认这份计划，所以到了第二天自动作废，不用手动清。
+
+用法：
+  qq-routine now                                  现在到底在干嘛
+  qq-routine add "19:00-20:30" "打篮球" --busy 1
+  qq-routine add "19:00-20:30" "打篮球" --line "在球场，手机扔场边"
+  qq-routine set ...                              跟 add 一样，换个子命令名
+  qq-routine list                                 今天排了什么
+  qq-routine clear                                今天的不算了
+
+busy 四个档位是节奏引擎认死的语义，别自己编：0 闲 / 1 有点忙 / 2 正忙 / 3 睡了。
+同一个 label + 同一个时间段再写一次是覆盖，不会叠两条 —— 免得她同时「在打球」又「在洗澡」。
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap  # noqa: E402
+
+DATA_DIR = os.environ.get("PANEL_DATA", "/opt/qqbot/panel/data")
+FILE = os.path.join(DATA_DIR, "campus-plan.json")
+
+SLOT_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[-~—到至]\s*(\d{1,2}):(\d{2})$")
+BUSY_NAMES = {0: "闲", 1: "有点忙", 2: "正忙", 3: "睡了"}
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def to_min(hhmm):
+    """'19:00' → 1140。脏数据返回 -1，不让排序崩掉。"""
+    try:
+        h, m = str(hhmm).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return -1
+
+
+def now_min():
+    t = datetime.datetime.now()
+    return t.hour * 60 + t.minute
+
+
+def parse_slot(text):
+    """'19:00-20:30' → ('19:00', '20:30')，顺手把空格、全角破折号、'到' 都认了。"""
+    raw = str(text or "").strip()
+    m = SLOT_RE.match(raw)
+    if not m:
+        qqcap.die(f"时间段要写成 \"19:00-20:30\" 这样，你给的是 \"{text}\"")
+    sh, sm, eh, em = (int(x) for x in m.groups())
+    for h, mi in ((sh, sm), (eh, em)):
+        if h > 23 or mi > 59:
+            qqcap.die(f"没有这个时间：{h:02d}:{mi:02d}（小时 0-23，分钟 0-59）")
+    a = f"{sh:02d}:{sm:02d}"
+    b = f"{eh:02d}:{em:02d}"
+    if a == b:
+        qqcap.die(f"开始和结束都是 {a}，这一条永远不会生效")
+    return a, b
+
+
+def load():
+    """
+    读今天的计划。
+    文件里是昨天的日期 → 当空，跟 campus.js 的 activePlan() 判断保持一致。
+    没写 date 的老文件按「一直有效」处理，这也是 campus.js 的语义。
+    """
+    try:
+        with open(FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(d, dict):
+        return []
+    if d.get("date") and d.get("date") != today():
+        return []
+    items = d.get("items")
+    if not isinstance(items, list):
+        return []
+    return [it for it in items if isinstance(it, dict) and it.get("from") and it.get("to")]
+
+
+def save(items):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    items = sorted(items, key=lambda it: to_min(it.get("from")))
+    tmp = FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"date": today(), "items": items}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, FILE)
+
+
+def covers(item, cur):
+    """这一刻在不在这一条里。跨零点的段（23:00-01:30）也认，跟 campus.js 一样。"""
+    a = to_min(item.get("from"))
+    b = to_min(item.get("to"))
+    if a < 0 or b < 0:
+        return False
+    return (a <= cur < b) if b >= a else (cur >= a or cur < b)
+
+
+def fmt(it):
+    b = int(it.get("busy") or 0)
+    return f"[{it.get('from')}-{it.get('to')}] {it.get('label')}（busy {b} {BUSY_NAMES.get(b, '')}）"
+
+
+def cmd_now(_):
+    items = load()
+    cur = now_min()
+    hit = next((it for it in items if covers(it, cur)), None)
+    if not hit:
+        print("现在没有临时安排。")
+        rest = [it for it in items if to_min(it.get("from")) > cur]
+        if rest:
+            print(f"今天之后还有：{fmt(min(rest, key=lambda it: to_min(it.get('from'))))}")
+        return
+    print(f"[{hit.get('label')}] {hit.get('line') or '你现在在' + str(hit.get('label'))}")
+    print(f"（{hit.get('from')}-{hit.get('to')}，busy {hit.get('busy')} "
+          f"{BUSY_NAMES.get(int(hit.get('busy') or 0), '')}）")
+
+
+def cmd_add(a):
+    frm, to = parse_slot(a.slot)
+    label = " ".join(str(a.label or "").split())
+    if not label:
+        qqcap.die("得说清楚在干嘛，比如 \"打篮球\"")
+    raw_busy = str(a.busy).strip()
+    if raw_busy not in ("0", "1", "2", "3"):
+        qqcap.die(f"--busy 只能是 0/1/2/3（0 闲 1 有点忙 2 正忙 3 睡了），你给的是 \"{raw_busy}\"")
+    busy = int(raw_busy)
+    line = " ".join(str(a.line or "").split()) or f"你现在在{label}"
+
+    items = load()
+    new = {"from": frm, "to": to, "label": label, "busy": busy, "line": line}
+    # 同一个 label + 同一个时间段 → 覆盖，不然她会同时在打球又在洗澡
+    dup = next((i for i, it in enumerate(items)
+                if it.get("label") == label and it.get("from") == frm and it.get("to") == to), None)
+    existed = dup is not None
+    if existed:
+        items[dup] = new
+    else:
+        items.append(new)
+    save(items)
+
+    print(f"[{'已更新' if existed else '已加入'}] {frm}-{to} {label}（busy {busy} {BUSY_NAMES[busy]}）")
+    print(line)
+    if covers(new, now_min()):
+        print("现在正好在这段时间里，这条立刻生效。")
+    else:
+        print(f"今天一共 {len(items)} 条安排，到点自动生效。")
+
+
+def cmd_list(_):
+    items = load()
+    if not items:
+        print("今天没有临时安排。")
+        print("要加就用：qq-routine add \"19:00-20:30\" \"打篮球\"")
+        return
+    print(f"今天的临时安排（{len(items)} 条）：")
+    for i, it in enumerate(items, 1):
+        print(f" {i:>2}. {fmt(it)}")
+        if it.get("line"):
+            print(f"     {it.get('line')}")
+
+
+def cmd_clear(_):
+    save([])
+    print("[已清空] 今天的临时安排都不算了，继续按日常日程走。")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description="改自己的当前状态（临时日程）")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_now = sub.add_parser("now", help="看看现在在干嘛")
+    p_now.set_defaults(func=cmd_now)
+
+    for name, h in (("add", "加一条临时安排"), ("set", "同 add（写起来顺一点）")):
+        p = sub.add_parser(name, help=h)
+        p.add_argument("slot", help="时间段，形如 19:00-20:30")
+        p.add_argument("label", help="在干嘛，比如 打篮球")
+        p.add_argument("--busy", default="1", help="0 闲 / 1 有点忙 / 2 正忙 / 3 睡了，默认 1")
+        p.add_argument("--line", default="", help="给别人看到的那句画面描述，省略就自动生成")
+        p.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="列出今天的安排")
+    p_list.set_defaults(func=cmd_list)
+
+    p_clear = sub.add_parser("clear", help="清空今天的安排")
+    p_clear.set_defaults(func=cmd_clear)
+
+    a = ap.parse_args()
+    if not getattr(a, "func", None):
+        print(__doc__)
+        return
+
+    # 能力开关：面板的「能力」页目前还没有「临时日程」这一项，qqcap.DEFAULTS 里
+    # 没有 routine 这个键，need() 对没登记的键一律放行 —— 所以这一句现在是空转。
+    # 留着是为了将来面板真加了开关时，这个文件一行都不用改。
+    qqcap.need("routine")
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,124 @@
+#!/usr/bin/env node
+/**
+ * qq-save-sticker —— 把一张图收进自己的表情库，并写清楚它表达什么。
+ *
+ * 标签是给「未来的自己」看的：下次遇到同样的情绪，是靠这些字把它挑出来的。
+ * 所以标签要写情绪和场合（无语、得意、摆烂），不要写「图片」「搞笑」「表情」
+ * 这种等于没写的词。
+ *
+ * 用法：
+ *   qq-save-sticker "/root/qq-workspace/downloads/abc.jpg" --tags "无语,白眼"
+ *   qq-save-sticker "/tmp/x.png" --tags "得意,哼" --desc "刚赢了嘴仗的时候扔出去"
+ *   qq-save-sticker "/tmp/x.png" --tags "敷衍" --name "敷衍_template.png"
+ */
+const fs = require('node:fs')
+const path = require('node:path')
+const LIB = process.env.QQPANEL_LIB || '/opt/qqbot/panel/lib'
+const CAP_FILE = process.env.QQCAP_FILE || '/root/qq-workspace/.capabilities.json'
+// 写不出人话的标签：模型偷懒时最爱产出这类词
+const JUNK_TAGS = new Set(['图片', '表情', '表情包', '搞笑', '有趣', '好玩', '图', '无', '好看', '梗图', '陌生人头像'])
+
+function disabled() {
+  try {
+    const caps = JSON.parse(fs.readFileSync(CAP_FILE, 'utf8'))
+    if (caps && caps.sticker === false) return true
+  } catch {
+    /* ignore */
+  }
+  return false
+}
+
+/**
+ * 看文件头判断真实格式。
+ *
+ * 聊天里收到的图路径是插件给的临时文件（原名 `media_17xxx.jpg`），
+ * 扩展名是它按「图片」猜的，经常和真实内容不符（PNG 存成 .jpg）。
+ * 名字可以随便，扩展名错了有些客户端会打不开，所以按字节重新认一遍。
+ */
+function sniffExt(file) {
+  const buf = Buffer.alloc(12)
+  try {
+    const fd = fs.openSync(file, 'r')
+    fs.readSync(fd, buf, 0, 12, 0)
+    fs.closeSync(fd)
+  } catch {
+    return path.extname(file).toLowerCase() || '.png'
+  }
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e) return '.png'
+  if (buf[0] === 0xff && buf[1] === 0xd8) return '.jpg'
+  if (buf.toString('ascii', 0, 3) === 'GIF') return '.gif'
+  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return '.webp'
+  return path.extname(file).toLowerCase() || '.png'
+}
+
+function parseArgs(argv) {
+  const out = { _: [], tags: [], desc: '', name: '' }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--tags' || a === '-t') {
+      out.tags = String(argv[++i] || '').split(/[，,、\s]+/).filter(Boolean)
+    } else if (a === '--desc' || a === '-d') {
+      out.desc = String(argv[++i] || '')
+    } else if (a === '--name') {
+      out.name = String(argv[++i] || '')
+    } else {
+      out._.push(a)
+    }
+  }
+  return out
+}
+
+async function main() {
+  if (disabled()) {
+    console.log('[能力已关闭：sticker] 需要先在控制面板的「表情包」页打开。')
+    process.exit(2)
+  }
+
+  const args = parseArgs(process.argv.slice(2))
+  const src = args._[0]
+  if (!src) {
+    console.log('[错误] 给我图片路径。用法：qq-save-sticker <路径> --tags "情绪1,情绪2" --desc "什么时候用"')
+    process.exit(1)
+  }
+  if (!fs.existsSync(src)) {
+    console.log(`[错误] 找不到文件：${src}`)
+    process.exit(1)
+  }
+
+  const tags = args.tags.filter((t) => !JUNK_TAGS.has(t)).slice(0, 6)
+  if (!tags.length) {
+    console.log('[错误] 至少要写一个情绪标签。--tags "无语,白眼"（别写「图片」「搞笑」这种）')
+    process.exit(1)
+  }
+
+  const lib = await import(path.join(LIB, 'stickers.js'))
+  const cfg = await import(path.join(LIB, 'store.js')).then((m) => m.loadConfig())
+  if (cfg.stickers?.autoSave === false) {
+    console.log('[能力已关闭：autoSave] 主人没让它自动存图。')
+    process.exit(2)
+  }
+
+  const r = lib.saveSticker(src, {
+    tags,
+    desc: args.desc,
+    // 没给名字就用标签起名：`嫌弃_怼人.png` 比 `media_1792583078909_6050cf49.jpg` 顺眼得多，
+    // 以后在面板上一眼也能认出是哪张。扩展名一律按真实内容改。
+    name: args.name ? args.name.replace(/\.[^.]+$/, '') + sniffExt(src) : tags.slice(0, 2).join('_') + sniffExt(src),
+    from: 'chat'
+  })
+  if (r.duplicate) {
+    console.log(`库里已经有了（${r.name}），不用重复存。`)
+    return
+  }
+  console.log(`已存：${r.name}`)
+  console.log(`标签：${tags.join('、')}${args.desc ? `　说明：${args.desc}` : ''}`)
+  console.log(`库存 ${r.count} / ${Number(cfg.stickers?.max) || 100} 张`)
+  if (r.count >= (Number(cfg.stickers?.max) || 100)) {
+    console.log('库已经满了，下次想存新的要先跟主人说一声。')
+  }
+}
+
+main().catch((e) => {
+  console.log(`[错误] ${e.message}`)
+  process.exit(1)
+})

@@ -1,0 +1,369 @@
+{
+  "version": 1,
+  "auth": {
+    "salt": "da8343611b3ab6f62b9161b2e661fb00",
+    "hash": "<SET_IN_PANEL>",
+    "secret": "9a9ec6558c93f1c104ed6d439a6d60fdc65e8c6bb10d06da880822c6b6bc3d8a",
+    "open": false,
+    "skipIPs": [],
+    "linkKey": ""
+  },
+  "qq": {
+    "adminQQ": "<YOUR_QQ>",
+    "botQQ": "<BOT_QQ>"
+  },
+  "dsh": {
+    "serviceName": "dsh-web",
+    "webPort": 3080,
+    "onebotPort": 8645,
+    "accessToken": "<DSH_ACCESS_TOKEN>"
+  },
+  "proxy": {
+    "port": 8643,
+    "enabled": true
+  },
+  "model": {
+    "provider": "deepseek-account",
+    "model": "deepseek-flash",
+    "reasoningEffort": "high"
+  },
+  "persona": {
+    "enabled": true,
+    "name": "小柒",
+    "callUser": "",
+    "identity": "一个有点懒但靠谱的朋友",
+    "style": "短句、口语化、不列清单",
+    "tone": "轻松自然，不油腻",
+    "maxChars": 100,
+    "emoji": true,
+    "catchphrases": "",
+    "avoid": "",
+    "extra": "",
+    "swear": 3,
+    "human": 85,
+    "askBack": 65,
+    "faceRate": 30,
+    "canLeave": true,
+    "moodEnabled": true
+  },
+  "campus": {
+    "enabled": true,
+    "age": 20,
+    "job": "student",
+    "grade": "大三",
+    "major": "新闻传播",
+    "riseAt": "08:00",
+    "lightsOut": "23:30",
+    "weekendWake": "10:30",
+    "busySlots": "根据活动安排",
+    "busyLabel": "",
+    "routine": {
+      "version": 1,
+      "source": "template:free",
+      "slots": [
+        {
+          "from": "10:00",
+          "to": "11:00",
+          "label": "刚起",
+          "busy": 0,
+          "line": "睡到自然醒，躺着还没起，阳光已经到床边了"
+        },
+        {
+          "from": "12:30",
+          "to": "13:30",
+          "label": "午饭",
+          "busy": 0,
+          "line": "在吃东西，慢慢吃，没什么要赶的"
+        },
+        {
+          "from": "19:00",
+          "to": "20:00",
+          "label": "晚饭",
+          "busy": 0,
+          "line": "在弄晚饭，一次做一两道，不急"
+        },
+        {
+          "from": "23:30",
+          "to": "02:00",
+          "label": "夜里",
+          "busy": 0,
+          "line": "夜里最安静，反而清醒，坐在那里听歌或者看书"
+        }
+      ],
+      "events": [
+        {
+          "label": "看云",
+          "from": "16:00",
+          "to": "17:00",
+          "busy": 0,
+          "line": "在阳台看云，云走得很慢，你也没动"
+        },
+        {
+          "label": "去散步",
+          "from": "17:00",
+          "to": "18:30",
+          "busy": 0,
+          "line": "在路边散步，一路走过去，没定目的地"
+        },
+        {
+          "label": "看书",
+          "from": "14:00",
+          "to": "17:00",
+          "busy": 1,
+          "line": "在看书，一本翻得很慢，还做了记号"
+        },
+        {
+          "label": "做饭",
+          "from": "17:30",
+          "to": "19:00",
+          "busy": 1,
+          "line": "在做饭，切了半天，厨房弄得很乱"
+        },
+        {
+          "label": "跑远一点",
+          "from": "09:00",
+          "to": "16:00",
+          "busy": 1,
+          "line": "跑出去玩了，去了个不近的地方，一整天在外面"
+        },
+        {
+          "label": "发呆",
+          "from": "15:00",
+          "to": "17:00",
+          "busy": 0,
+          "line": "坐着发呆，也没想什么，就这么过去了"
+        },
+        {
+          "label": "听歌",
+          "from": "20:00",
+          "to": "22:00",
+          "busy": 0,
+          "line": "戴着耳机听歌，一首循环了很久"
+        },
+        {
+          "label": "收拾屋子",
+          "from": "10:00",
+          "to": "12:00",
+          "busy": 1,
+          "line": "在收拾屋子，收拾到一半坐下喝东西"
+        },
+        {
+          "label": "见朋友",
+          "from": "18:00",
+          "to": "21:00",
+          "busy": 0,
+          "line": "跟朋友在一起，吃着东西聊到很晚"
+        },
+        {
+          "label": "去游泳",
+          "from": "15:00",
+          "to": "17:00",
+          "busy": 1,
+          "line": "去游泳了，水有点凉，游完精神好很多"
+        }
+      ],
+      "eventsPerDay": 2
+    },
+    "eventsPerDay": "auto",
+    "classSlots": "根据活动安排"
+  },
+  "whitelist": {
+    "enabled": true,
+    "entries": []
+  },
+  "reply": {
+    "probability": 1,
+    "quiet": {
+      "enabled": false,
+      "from": "23:30",
+      "to": "07:30"
+    },
+    "keywordOnly": {
+      "enabled": false,
+      "words": []
+    },
+    "requireMention": true,
+    "groupPolicy": "disabled",
+    "speed": 0.05,
+    "coalesceMs": 2300,
+    "coalesceMaxMs": 3000,
+    "interimMessages": false,
+    "split": {
+      "enabled": true,
+      "maxChars": 20,
+      "gapMs": 1200,
+      "maxParts": 4
+    },
+    "hideSystemNotice": true,
+    "pace": {
+      "enabled": true,
+      "mode": "mix",
+      "instantRate": 90,
+      "nightSlow": true,
+      "skipLowValue": true
+    },
+    "assoc": {
+      "enabled": false,
+      "chance": 20,
+      "maxStreak": 2
+    },
+    "opinion": {
+      "enabled": true,
+      "chance": 20
+    },
+    "quote": {
+      "enabled": true,
+      "chance": 60
+    }
+  },
+  "typing": {
+    "enabled": true,
+    "cps": 4,
+    "baseMs": 500,
+    "maxMs": 12000
+  },
+  "capabilities": {
+    "search": true,
+    "music": true,
+    "hear": true,
+    "douyin": true,
+    "ocr": true,
+    "download": true,
+    "face": true,
+    "avatar": true,
+    "stances": true,
+    "routine": true
+  },
+  "search": {
+    "provider": "deepseek",
+    "apiKey": "",
+    "count": 5
+  },
+  "stickers": {
+    "enabled": true,
+    "freq": 80,
+    "adaptive": true,
+    "autoSave": true,
+    "max": 100,
+    "react": true,
+    "reactFreq": 75,
+    "syncToQQ": true
+  },
+  "vision": {
+    "mode": "auto",
+    "baseUrl": "https://api.deepseek.com/v1",
+    "apiKey": "",
+    "model": "deepseek-flash",
+    "prompt": "用一两句话客观描述这张图片的内容和氛围，中文，不超过 60 字。不要加引号。"
+  },
+  "imageGen": {
+    "enabled": true,
+    "baseUrl": "https://ws-v2g1n603lts2ayia.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "apiKey": "",
+    "model": "qwen-image-3.0",
+    "size": "1024x1024"
+  },
+  "asr": {
+    "provider": "local",
+    "baseUrl": "",
+    "apiKey": "",
+    "model": "",
+    "language": "zh"
+  },
+  "groups": {
+    "enabled": false,
+    "requireMention": true,
+    "entries": []
+  },
+  "slang": {
+    "enabled": true,
+    "injectMax": 10,
+    "minCount": 2,
+    "learnDaily": true,
+    "learnAt": "23:30",
+    "autoResearch": false
+  },
+  "features": {
+    "stt": true,
+    "sttModel": "base",
+    "t2i": true,
+    "vision": true
+  },
+  "context": {
+    "maxMessages": 800,
+    "auto": true
+  },
+  "proactive": {
+    "enabled": true,
+    "activeFrom": "09:00",
+    "activeTo": "23:00",
+    "minGap": 2,
+    "maxGap": 30,
+    "dailyMax": 999,
+    "idleMinutes": 5,
+    "allowVoice": true,
+    "hotDailyMax": 10,
+    "soloSticker": true,
+    "learnHours": true,
+    "sneakEnabled": true,
+    "sneakDailyMax": 20,
+    "sneakChance": 70,
+    "weights": {
+      "complain": 2,
+      "daily": 4,
+      "ask": 6,
+      "share": 5,
+      "hot": 5,
+      "interest": 5,
+      "recall": 5,
+      "bored": 4,
+      "opinion": 2
+    },
+    "continueThreshold": 5,
+    "continueBoost": 7,
+    "moodGaps": {
+      "angry": 1.5,
+      "sad": 1.3,
+      "cold": 1.4,
+      "normal": 1,
+      "happy": 0.85,
+      "excited": 0.7
+    }
+  },
+  "voice": {
+    "enabled": true,
+    "provider": "volc",
+    "voiceName": "zh-CN-XiaoyiNeural",
+    "rate": "-20%",
+    "pitch": "+12Hz",
+    "allowAuto": true,
+    "autoRate": 30,
+    "volc": {
+      "appId": "",
+      "accessToken": "",
+      "resourceId": "seed-tts-2.0",
+      "speakerId": "",
+      "speed": 0.8,
+      "emotion": "",
+      "cluster": "volcano_icl",
+      "preset": "zh_female_xiaohe_uranus_bigtts"
+    }
+  },
+  "qzone": {
+    "enabled": true,
+    "autoEnabled": true,
+    "autoFrom": "12:00",
+    "autoTo": "22:00",
+    "autoDailyMax": 1,
+    "imageChance": 50
+  },
+  "profiles": {
+    "enabled": true,
+    "visitor": {},
+    "users": []
+  },
+  "paths": {
+    "workspace": "<WORKSPACE_PATH>",
+    "stickers": "<WORKSPACE_PATH>/stickers"
+  }
+}

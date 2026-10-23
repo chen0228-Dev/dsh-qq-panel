@@ -1,0 +1,41 @@
+# ---- 配置与运行时数据（含密钥，绝对不能提交）----
+panel/data/
+panel/data/config.json
+panel/data/state.json
+panel/data/*.json
+panel/data/internal.token
+panel/data/logs/
+data/
+*.local.json
+
+# ---- 工作区（她的文件、表情、语音、下载、生成图）----
+qq-workspace/
+stickers/
+voice/
+downloads/
+generated-images/
+
+# ---- 依赖与缓存 ----
+node_modules/
+__pycache__/
+*.pyc
+.pnpm-store/
+
+# ---- 备份与临时 ----
+*.bak
+*.bak-*
+*.corrupt-*
+*.tmp
+*.log
+_t/
+_t*/
+_v1/
+_v2/
+_ct/
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

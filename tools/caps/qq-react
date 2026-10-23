@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""qq-react —— 给对方某条消息贴个大表情（不占一条消息）。
+
+贴图的前提是要知道 message_id，而模型看到的只有聊天文字。所以面板的代理把
+每个会话「最后一条入站消息」记在 /root/qq-workspace/last-msg.json，这里直接
+拿来用 —— 默认贴的就是对方最后那条。
+
+用法：
+  qq-react 点赞                给对方最后那条消息贴「点赞」
+  qq-react 666 --to 123456     给某个 QQ 号最后那条贴
+  qq-react 爱心 --msg-id 789   指定某条消息
+  qq-react 赞 --cancel         取消刚才贴的
+  qq-react --list              看看都能贴什么
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+
+PANEL = "http://127.0.0.1:18080/api/qq/action"
+STATE_FILE = "/root/qq-workspace/last-msg.json"
+CONFIG = "/opt/qqbot/panel/data/config.json"
+
+# emoji_id 用的是 QQ 自己的表情编号（跟 [face:14] 那一套同源）。
+# 名字是给它看的：它想表达的意思往往就是这几个词。
+EMOJI = {
+    "赞": 76, "点赞": 201, "强": 299, "牛": 299, "牛啊": 299, "厉害": 299,
+    "爱心": 66, "心": 66, "红心": 66, "爱情": 42, "示爱": 116, "爱你": 122, "玫瑰花": 63, "亲亲": 109,
+    "呵呵": 14, "微笑": 14, "害羞": 21, "可爱": 21, "得意": 4, "酷": 16,
+    "笑哭": 182, "捂脸": 264, "流泪": 5, "大哭": 9, "泪奔": 173, "委屈": 106, "可怜": 111,
+    "笑死": 182, "逗": 101, "坏笑": 101, "狗头": 179, "doge": 179, "吃瓜": 271, "暗中观察": 269,
+    "嗯": 287, "哦": 287, "佛系": 232, "摸鱼": 285, "面无表情": 284, "无奈": 174, "emm": 270,
+    "疑问": 32, "问号": 268, "摇头": 103, "哼": 102, "晕": 34, "汗": 278, "擦汗": 97,
+    "握手": 78, "抱拳": 118, "ok": 124, "OK": 124, "no": 123, "NO": 123, "勾": 124, "叉": 123,
+    "拥抱": 49, "加油": 246, "谢谢": 297, "元宝": 298, "恭喜": 298,
+    "庆祝": 144, "鼓掌": 99, "拍手": 227, "开心": 290, "惊喜": 180, "期待": 294, "666": 201,
+    "咖啡": 60, "西瓜": 89, "月亮": 75, "太阳": 74,
+}
+
+# 别名：模型不会背这张表，它会按字面意思说「抱抱」「亲亲」「无语」。
+# 这里把最容易被说出口的说法都接住，接不住的再给近似建议。
+ALIAS = {
+    "抱抱": 49, "抱一抱": 49, "抱": 49, "摸摸": 49,
+    "亲亲": 109, "亲": 109, "啵啵": 214, "飞吻": 85,
+    "睡觉": 8, "晚安": 8, "困": 25, "睡": 8,
+    "哭": 5, "流泪": 5, "泪目": 5, "想哭": 106,
+    "笑": 182, "大笑": 182, "好笑": 182, "憋笑": 101,
+    "厉害": 299, "牛逼": 299, "棒": 201, "给力": 201,
+    "无语": 284, "沉默": 284, "尬": 10, "尴尬": 10,
+    "疑惑": 32, "不懂": 32, "晕": 34, "汗": 278,
+    "生气": 38, "气": 38, "敲打": 38, "打你": 38,
+    "加油": 246, "鼓励": 246, "安慰": 49, "心疼": 49,
+    "谢谢": 297, "感谢": 297, "恭喜": 298, "庆祝": 144,
+    "期待": 294, "惊喜": 180, "害羞": 21, "可爱": 21,
+    "ok": 124, "好的": 124, "no": 123, "不行": 123,
+    "白眼": 284, "冷漠": 284, "看戏": 271, "吃瓜群众": 271,
+}
+EMOJI.update({k: v for k, v in ALIAS.items() if k not in EMOJI})
+
+
+def resolve(name):
+    """名字 → emoji_id。认不出来就返回 None（由调用方给建议）。"""
+    n = name.strip()
+    if n in EMOJI:
+        return EMOJI[n]
+    if n.isdigit():
+        return int(n)
+    low = n.lower()
+    for k, v in EMOJI.items():
+        if k.lower() == low:
+            return v
+    # 半截命中：「抱」→ 抱抱/拥抱，「心」→ 爱心。取最短的那个键，避免撞到长串
+    hits = [(k, v) for k, v in EMOJI.items() if k in n or n in k]
+    if hits:
+        return sorted(hits, key=lambda kv: len(kv[0]))[0][1]
+    return None
+
+
+def suggest(name):
+    """给个近似列表，让它下一步能选对，而不是硬猜第二次。"""
+    chars = set(name)
+    scored = sorted(
+        ((sum(1 for c in k if c in chars), k) for k in EMOJI),
+        key=lambda x: (-x[0], len(x[1])),
+    )
+    return [k for s, k in scored if s > 0][:8] or sorted(EMOJI, key=len)[:8]
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap  # noqa: E402
+
+
+def call(action, params=None, timeout=25000):
+    body = json.dumps({"action": action, "params": params or {}, "timeout": timeout}).encode()
+    req = urllib.request.Request(PANEL, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout / 1000 + 10) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        print(f"[错误] 调用失败：{e}")
+        sys.exit(1)
+
+
+def last_msg(to=None):
+    """挑出要贴的那条消息：指定了 QQ 就找那个会话，否则用最近的一条。"""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            book = json.load(f)
+    except Exception:
+        print("[错误] 还不知道往哪贴 —— 没记录到对方的消息，让他先说一句再试。")
+        sys.exit(1)
+
+    if to:
+        key = "private:" + str(to)
+        hit = book.get(key)
+        if not hit:
+            print(f"[错误] 没有记下 {to} 发来的消息。让他先发一句再贴。")
+            sys.exit(1)
+        return key, hit
+
+    if not book:
+        print("[错误] 还没有任何入站消息记录。")
+        sys.exit(1)
+    key = max(book, key=lambda k: book[k].get("time", 0))
+    return key, book[key]
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("name", nargs="?", help="要贴的表情名字，见 --list")
+    ap.add_argument("--list", action="store_true", help="列出可用的表情名字")
+    ap.add_argument("--to", help="给某人的最后一条消息贴（QQ 号）")
+    ap.add_argument("--msg-id", dest="msg_id", help="直接指定 message_id")
+    ap.add_argument("--cancel", action="store_true", help="取消（再贴一次同一个表情就是取消）")
+    args = ap.parse_args()
+
+    qqcap.need("sticker")
+
+    if args.list:
+        print("可用的表情：")
+        print("  " + " · ".join(sorted(set(EMOJI), key=lambda s: (len(s), s))))
+        print("")
+        print("也可以直接写数字编号（比如 66 就是爱心）。同一个表情再贴一次 = 取消。")
+        return
+
+    if not args.name:
+        print("[错误] 要贴哪个表情？跑 qq-react --list 看名字。")
+        sys.exit(1)
+
+    key = resolve(args.name)
+    if key is None:
+        near = "、".join(suggest(args.name))
+        print(f"[错误] 没有叫「{args.name}」的表情。接近的有：{near}")
+        print("也可以直接写数字编号（qq-react --list 里每个名字都对应一个 QQ 表情编号）。")
+        sys.exit(1)
+
+    if args.msg_id:
+        msg_id = str(args.msg_id)
+        target = "那条消息"
+    else:
+        chat, hit = last_msg(args.to)
+        msg_id = str(hit.get("id", ""))
+        if not msg_id:
+            print("[错误] 记录里没有 message_id，用 --msg-id 直接指定。")
+            sys.exit(1)
+        preview = (hit.get("preview") or "").strip()
+        target = f"{chat} 的最后一条" + (f"（「{preview}」）" if preview else "")
+
+    d = call("set_msg_emoji_like", {"message_id": msg_id, "emoji_id": str(key), "set": False if args.cancel else True})
+    if not d.get("ok"):
+        print(f"[错误] 贴失败：{d.get('error') or '接口没答应'}")
+        print("可能原因：那条消息太久了已经被回收，或者这个账号不能给那条消息贴图。")
+        sys.exit(1)
+
+    what = args.name.strip()
+    print(f"已给{target}贴上「{what}」。" if not args.cancel else f"已取消「{what}」。")
+    print("不用再追一句话了 —— 它本身就是回应。")
+
+
+if __name__ == "__main__":
+    main()

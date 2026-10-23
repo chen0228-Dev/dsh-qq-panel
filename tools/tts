@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""tts —— 文字转语音，打印出 mp3 文件的绝对路径。
+
+用法：
+  tts "要说的话"                    用面板里配好的音色/语速/情感
+  tts "要说的话" zh-CN-XiaoxiaoNeural   临时换成某个 Edge 音色
+  tts "要说的话" Xiaoyi             同上，允许简写（自动补 zh-CN-…Neural）
+
+**为什么不再用 edge-tts 直连**：这个脚本以前是
+`edge-tts --voice zh-CN-XiaoyiNeural --rate "+8%" --pitch "+2Hz"`，参数全写死。
+面板上把音色换成火山复刻的 vv、语速调成 0.8，试听是对的，
+可她聊天里真发出来的还是 XiaoyiNeural —— 两条链路各用各的参数，设置等于没生效。
+
+现在一律走面板本机接口 `/api/voice/synth`，和试听共用同一个 synthesize()：
+火山优先、失败自动回退 Edge，音色/语速/情感/资源 ID 全从面板配置来。
+
+鉴权用 panel/data/internal.token（0600），不把「本机能连」当成「有权限用」。
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+PANEL = os.environ.get('QQPANEL_URL', 'http://127.0.0.1:18080')
+TOKEN_FILE = os.environ.get('QQPANEL_TOKEN_FILE', '/opt/qqbot/panel/data/internal.token')
+
+
+def die(msg, code=1):
+    print(f'tts: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def token():
+    try:
+        with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+            t = f.read().strip()
+    except OSError as e:
+        die(f'读不到面板内部令牌（{TOKEN_FILE}）：{e}')
+    if len(t) < 32:
+        die('面板内部令牌异常，重启面板会重新生成')
+    return t
+
+
+def main():
+    # 不用 argparse：它会把 "要 说的话" 里带空格的多段自动合并，
+    # 但也会把以 '-' 开头的正文当参数报错。这里手工解析更省事，
+    # 也保住老用法 `tts "文字" [音色]`。
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h', '--help'):
+        print('用法: tts "要说的话" [音色]', file=sys.stderr)
+        sys.exit(0 if args else 1)
+
+    # 只认「已知音色」和「完整 zh- 名字」。
+    # 不能见到英文单词就当音色 —— 正文里出现 "OK"、"emo" 这类词时会把句子吃掉一半。
+    known = {
+        'zh-CN-XiaoyiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural',
+        'zh-CN-liaoning-XiaobeiNeural', 'zh-CN-YunyangNeural',
+    }
+    short = {
+        'xiaoyi': 'zh-CN-XiaoyiNeural', 'xiaoxiao': 'zh-CN-XiaoxiaoNeural',
+        'yunxi': 'zh-CN-YunxiNeural', 'xiaobei': 'zh-CN-liaoning-XiaobeiNeural',
+        'yunyang': 'zh-CN-YunyangNeural',
+    }
+    voice = None
+    if len(args) >= 2:
+        cand = args[-1]
+        if cand in known or cand.startswith('zh-') or cand.lower() in short:
+            voice = cand
+            args = args[:-1]
+
+    text = ' '.join(args).strip()
+    if not text:
+        die('要说的内容不能为空')
+
+    if voice and voice.lower() in short:
+        voice = short[voice.lower()]
+
+    body = {'text': text}
+    if voice:
+        body['voiceName'] = voice
+
+    req = urllib.request.Request(
+        PANEL + '/api/voice/synth',
+        data=json.dumps(body, ensure_ascii=False).encode('utf-8'),
+        headers={'Content-Type': 'application/json', 'X-Panel-Token': token()},
+        method='POST',
+    )
+    try:
+        # 火山合成偶尔要几秒，给足 90 秒（老脚本 edge-tts 是 60s 超时）
+        with urllib.request.urlopen(req, timeout=90) as r:
+            j = json.loads(r.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode('utf-8', 'replace')
+        try:
+            die(json.loads(raw).get('error') or f'HTTP {e.code}')
+        except json.JSONDecodeError:
+            die(f'HTTP {e.code}: {raw[:200]}')
+    except urllib.error.URLError as e:
+        die(f'连不上面板（{PANEL}）：{e.reason}')
+
+    if not j.get('ok'):
+        die(j.get('error') or '合成失败')
+    file = j.get('file')
+    if not file or not os.path.exists(file):
+        die('接口说成功了，但拿不到音频文件')
+    print(file)
+
+
+if __name__ == '__main__':
+    main()
