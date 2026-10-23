@@ -16,7 +16,7 @@ import {
   DATA_DIR
 } from './store.js'
 import { bumpStats, markUsed } from './stickers.js'
-import { isLowValue, planPace } from './pacing.js'
+import { isLowValue, planPace, smartWindowMs } from './pacing.js'
 import { campusState, addPlanItem, addExtraEvent, pickSlotForCampus, normalizeEventsPerDay } from './campus.js'
 import { detectGoAway, detectWish } from './goaway.js'
 import { requestHint } from './request.js'
@@ -102,6 +102,21 @@ export function parseConvState(plain) {
   } catch {
     return null
   }
+}
+
+/**
+ * 从一条 OneBot 帧里拼出纯文字（丢掉图片/表情/语音段）。
+ *
+ * 存在的意义：传进 `queueMessage` 的 `text` 是**整段 JSON**，
+ * 直接拿去判「有没有内容」「说没说完」什么都会当真。
+ * 必须先从 `frame.message` 里挑出 type=text 的段拼起来。
+ */
+export function plainTextOf(frame) {
+  const segs = Array.isArray(frame?.message) ? frame.message : []
+  return segs
+    .filter((s) => s && s.type === 'text')
+    .map((s) => String(s.data?.text || ''))
+    .join('')
 }
 
 /** 秒数说成人话：「45 秒」/「6 分钟」 */
@@ -2207,7 +2222,11 @@ class Proxy {
 
   bufferMessage(text, frame, win) {
     const cfg = this.cfgFor(frame.user_id)
-    const maxWait = Math.max(win, Number(cfg.reply?.coalesceMaxMs ?? 3000))
+    const isSmart = cfg.reply?.coalesceMode === 'smart'
+    // smart 模式的硬上限单独算（用户要的 5 秒），fixed 沿用原来的 coalesceMaxMs
+    const maxWait = isSmart
+      ? Math.max(500, Number(cfg.reply?.coalesceSmartMaxMs ?? 5000))
+      : Math.max(win, Number(cfg.reply?.coalesceMaxMs ?? 3000))
     const key = this.chatKey(frame)
     const now = Date.now()
 
@@ -2226,7 +2245,9 @@ class Proxy {
       this.flushInbox(key)
       return
     }
-    b.timer = setTimeout(() => this.flushInbox(key), Math.min(win, left))
+    // smart 模式：按「最新这条看起来说完没」决定等多久；fixed 模式：固定窗口 win
+    const wait = isSmart ? smartWindowMs(cfg, plainTextOf(frame)) : win
+    b.timer = setTimeout(() => this.flushInbox(key), Math.min(wait, left))
   }
 
   flushInbox(key) {

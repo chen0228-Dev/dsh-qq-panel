@@ -753,13 +753,35 @@
     <div class="card" data-gate="r-quote">
       <h3>连发合并</h3>
       <p class="hint">你连着发好几条消息时，它先等一小会儿把这几条收齐，当成一次输入来判断——意思连贯就合并回一次，不连贯就分别回。</p>
+
       <div class="field">
+        <label>判断方式</label>
+        <select class="select" id="r-coalescemode">
+          <option value="fixed">固定窗口 · 等固定时间，不看内容</option>
+          <option value="smart">智能判断 · 看你说完没，最多等 5 秒</option>
+        </select>
+        <p class="muted" id="r-coalescemodedesc" style="margin-top:6px"></p>
+      </div>
+
+      <div class="field" id="r-coalescebox">
         <label>等待窗口：<span class="val" id="r-coalescelabel">1.0 秒</span></label>
         <input type="range" class="slider" id="r-coalesce" min="0" max="3000" step="100" />
         <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--tx3);margin-top:4px">
           <span>0 · 关闭（逐条回）</span><span>1 秒 · 推荐</span><span>3 秒 · 等更久</span>
         </div>
       </div>
+
+      <div class="field hide" id="r-smartbox">
+        <label>说完了等多久再回：<span class="val" id="r-smartminlabel">0.8 秒</span></label>
+        <input type="range" class="slider" id="r-smartmin" min="300" max="2000" step="100" />
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--tx3);margin-top:4px">
+          <span>0.3 秒 · 抢话风险</span><span>0.8 秒 · 推荐</span><span>2 秒 · 更稳</span>
+        </div>
+        <label style="margin-top:12px">最长等多久（说到一半没下文时）：<span class="val" id="r-smartmaxlabel">5.0 秒</span></label>
+        <input type="range" class="slider" id="r-smartmax" min="1000" max="10000" step="500" />
+        <p class="muted" style="margin-top:6px">判断规则看句尾：句号／问号／感叹号 → 说完了，快回；以逗号、<code>然后</code>、<code>因为</code>、<code>我觉得</code>这类结尾 → 还在说，继续等。等待期间你每发一条都会重新判断。</p>
+      </div>
+
       <p class="muted" id="r-coalescedesc"></p>
       <div class="switch gate-head" style="margin-top:14px"><div><div class="lab">接不上时引用原消息</div><div class="sub">他连发几条、前后不是同一件事时，回哪条就带上哪条的引用；分得清就正常回，不引用</div></div>
         <label class="tg"><input type="checkbox" id="r-quote" /><span></span></label></div>
@@ -2422,6 +2444,11 @@ function render() {
   const co = Number(r.coalesceMs ?? 1000);
   $('r-coalesce').value = co;
   updateCoalesceLabel(co);
+  // 连发合并的判定方式（2026-10-23）：fixed 用上面那个窗口，smart 用下面两个
+  $('r-coalescemode').value = r.coalesceMode === 'smart' ? 'smart' : 'fixed';
+  $('r-smartmin').value = Number(r.coalesceSmartMinMs ?? 800);
+  $('r-smartmax').value = Number(r.coalesceSmartMaxMs ?? 5000);
+  updateCoalesceMode();
   const pc = r.pace || {};
   if ($('r-pace')) {
     $('r-pace').checked = pc.enabled !== false;
@@ -2792,6 +2819,9 @@ function updateSwearDesc(v) {  const d = $('p-sweardesc');
 $('r-prob').oninput = () => { $('r-problabel').textContent = $('r-prob').value; };
 $('ctx-max').oninput = () => updateCtxLabel($('ctx-max').value);
 $('r-coalesce').oninput = () => updateCoalesceLabel($('r-coalesce').value);
+$('r-coalescemode').onchange = updateCoalesceMode;
+$('r-smartmin').oninput = updateSmartLabels;
+$('r-smartmax').oninput = updateSmartLabels;
 if ($('r-pacerate')) $('r-pacerate').oninput = () => { $('r-pacerateLabel').textContent = $('r-pacerate').value; };
 if ($('r-assocchance')) $('r-assocchance').oninput = () => { $('r-assoclabel').textContent = $('r-assocchance').value; };
 if ($('r-opinionchance')) $('r-opinionchance').oninput = () => { $('r-opinionlabel').textContent = $('r-opinionchance').value; };
@@ -3065,6 +3095,46 @@ function updateCoalesceLabel(ms) {
   }
 }
 
+/**
+ * 切换「固定窗口 / 智能判断」两套控件。
+ *
+ * 两套参数是并存的：切回 fixed 时 smart 的值还留着，切回去不用重设。
+ * 同理 fixed 的窗口也一直在，随时能换回来。
+ */
+function updateCoalesceMode() {
+  const smart = $('r-coalescemode').value === 'smart';
+  const fixedBox = $('r-coalescebox');
+  const smartBox = $('r-smartbox');
+  if (fixedBox) fixedBox.classList.toggle('hide', smart);
+  if (smartBox) smartBox.classList.toggle('hide', !smart);
+  const desc = $('r-coalescemodedesc');
+  if (desc) {
+    desc.textContent = smart
+      ? '看内容判断：句末有标点（。！？）就当你讲完了，快速回；以逗号、"然后""因为""我觉得"这类结尾就继续等。你每发一条都会重新判断，最多等 5 秒。'
+      : '固定等一段时间，不看内容。最简单、最可预期，但"我今天去"和"今天真倒霉。"等的时间一样长。';
+  }
+  const d = $('r-coalescedesc');
+  if (d) d.style.display = smart ? 'none' : '';
+  updateSmartLabels();
+}
+
+function updateSmartLabels() {
+  const minEl = $('r-smartmin');
+  const maxEl = $('r-smartmax');
+  if (!minEl || !maxEl) return;
+  const min = Number(minEl.value) || 800;
+  let max = Number(maxEl.value) || 5000;
+  // 最长不能比最短还短 —— 否则规则自相矛盾，代码里会取 max(min, max) 静默兜住
+  if (max < min) {
+    max = min;
+    maxEl.value = String(min);
+  }
+  const a = $('r-smartminlabel');
+  const b = $('r-smartmaxlabel');
+  if (a) a.textContent = (min / 1000).toFixed(1) + ' 秒';
+  if (b) b.textContent = (max / 1000).toFixed(1) + ' 秒';
+}
+
 function updateCtxLabel(n) {
   n = Number(n) || 200;
   const el = $('ctx-label');
@@ -3291,6 +3361,9 @@ function collect(section) {
       quiet: { enabled: $('r-quiet').checked, from: $('r-qfrom').value || '23:30', to: $('r-qto').value || '07:30' },
       keywordOnly: { enabled: $('r-kw').checked, words },
       coalesceMs: Number($('r-coalesce').value),
+      coalesceMode: $('r-coalescemode').value,
+      coalesceSmartMinMs: Number($('r-smartmin').value),
+      coalesceSmartMaxMs: Number($('r-smartmax').value),
       pace: {
         enabled: $('r-pace').checked,
         mode: $('r-pacemode').value,
