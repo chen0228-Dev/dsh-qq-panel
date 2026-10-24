@@ -18,9 +18,16 @@ const pass = (id, name, ok, extra = '') => {
   console.log(`[${ok ? 'PASS' : 'FAIL'}] ${id} ${name}${extra ? ' — ' + extra : ''}`)
 }
 
-const setAssoc = (o) => saveConfig({ reply: { assoc: { enabled: true, chance: 100, maxStreak: 99, ...o } } })
+/**
+ * 2026-10-24：新增 contextFirst。这里刻意让默认走**新路径**（contextFirst 开），
+ * 但把 poolChance 拉到 100、hintCount 拉到 2 —— 这样素材一定会出现，
+ * 下面那些"素材不重复/由头能对上"的老断言仍然测得到东西，
+ * 而不是因为概率为 0 变成了空过。
+ */
+const BASE = { enabled: true, chance: 100, maxStreak: 99, contextFirst: true, poolChance: 100, hintCount: 2 }
+const setAssoc = (o) => saveConfig({ reply: { assoc: { ...BASE, ...o } } })
 const call = (text, extra = {}) => assocLine(null, { text, busy: 0, sneak: false, ...extra }) || ''
-const cfgOf = (o) => ({ reply: { assoc: { enabled: true, chance: 100, maxStreak: 99, ...o } } })
+const cfgOf = (o) => ({ reply: { assoc: { ...BASE, ...o } } })
 const run = (text, o = {}, extra = {}) => assocLine(cfgOf(o), { text, busy: 0, sneak: false, ...extra })
 
 /* ---------- A1 开关 ---------- */
@@ -160,6 +167,62 @@ p2.upstream = { readyState: 1, send: (x) => cap2.push(String(x)) }
 p2.dispatch(JSON.stringify(frame), frame)
 await new Promise((r) => setTimeout(r, 300))
 pass('A13', '关掉后 dispatch 不再注入联想', !/这条可以不只接话/.test(cap2.join('\n')))
+
+/* ================= 2026-10-24：岔开时先接上下文 ================= */
+/*
+ * 用户原话：「每次聊着聊着就扯其他的去了，显得很不礼貌。」
+ * 根因不是读不到上下文（dsh 的 session 里有完整对话），是提示在反向鼓励：
+ * 老文本写「也可以完全没由头地想起一件小事」，素材抽取还刻意补一条标签不重叠的。
+ */
+
+/* ---------- A14 新默认：先往回看 ---------- */
+resetAssoc()
+const ctx = run('今天好累啊', { chance: 100 })
+pass('A14', '默认就走新路径（有「往回看一眼」的引导）', /往回看一眼你们刚聊到哪儿/.test(ctx))
+pass('A14b', '三档线索都点了名', /说到一半/.test(ctx) && /他提过/.test(ctx) && /一直在意/.test(ctx))
+pass('A14c', '明确要求「有就接着说那个」', /上面任何一条有，就接着说那个/.test(ctx))
+pass('A14d', '素材被降级成兜底', /兜底，不是首选/.test(ctx))
+pass('A14e', '不再鼓励「完全没由头」', !/完全没由头地想起一件小事/.test(ctx))
+
+/* ---------- A15 poolChance=0：一件无关小事都不给 ---------- */
+resetAssoc()
+const noPool = run('今天好累啊', { chance: 100, poolChance: 0 })
+pass('A15', 'poolChance=0 时不给任何素材', noPool && !/·\s*\S/.test(noPool))
+pass('A15b', '但仍然给了「可以接上下文」的许可', /往回看一眼/.test(noPool))
+pass('A15c', '并且写明「没可接的就别硬岔」', /没有可接的就别硬岔/.test(noPool))
+
+/* ---------- A16 hintCount 生效 ---------- */
+resetAssoc()
+const one = run('今天好累啊', { chance: 100, poolChance: 100, hintCount: 1 })
+pass('A16', 'hintCount=1 时只给 1 条素材', (one.match(/·\s*\S/g) || []).length === 1, `实际 ${(one.match(/·\s*\S/g) || []).length} 条`)
+resetAssoc()
+const three = run('今天好累啊', { chance: 100, poolChance: 100, hintCount: 3 })
+pass('A16b', 'hintCount=3 时给 3 条', (three.match(/·\s*\S/g) || []).length === 3, `实际 ${(three.match(/·\s*\S/g) || []).length} 条`)
+
+/* ---------- A17 回滚路径：contextFirst=false 一个字都不改 ---------- */
+resetAssoc()
+const legacy = run('今天好累啊', { chance: 100, contextFirst: false })
+pass('A17', '关掉后回到老文本', /也可以完全没由头地想起一件小事/.test(legacy))
+pass('A17b', '老文本没有新加的上下文引导', !/往回看一眼/.test(legacy))
+pass('A17c', '老文本固定 2 条素材', (legacy.match(/·\s*\S/g) || []).length === 2, `实际 ${(legacy.match(/·\s*\S/g) || []).length} 条`)
+
+/* ---------- A18 streak 照旧计入（用户 2026-10-24 拍的取舍） ---------- */
+resetAssoc()
+run('今天好累啊', { chance: 100, poolChance: 0 })
+pass('A18', '只给上下文引导、没给素材时，streak 也 +1', assocInfo().streak === 1, `streak=${assocInfo().streak}`)
+resetAssoc()
+run('今天好累啊', { chance: 100, poolChance: 0, maxStreak: 1 })
+const blocked = run('今天随便聊聊', { chance: 100, poolChance: 0, maxStreak: 1 })
+pass('A18b', '因此满 streak 后仍然会断一轮', blocked === '')
+
+/* ---------- A19 last 记录带上模式 ---------- */
+resetAssoc()
+run('今天好累啊', { chance: 100, poolChance: 0 })
+pass('A19', '没给素材时记成「接上文」', /接上文/.test(String(assocInfo().last?.to || '')), String(assocInfo().last?.to))
+pass('A19b', 'mode 标成 context', assocInfo().last?.mode === 'context', String(assocInfo().last?.mode))
+resetAssoc()
+run('今天好累啊', { chance: 100, poolChance: 100 })
+pass('A19c', '给了兜底素材时 mode 标成 context+pool', assocInfo().last?.mode === 'context+pool', String(assocInfo().last?.mode))
 
 /**
  * 恢复共享配置。

@@ -181,12 +181,16 @@ function hitTags(text) {
 }
 
 /**
- * 抽素材：一条「有由头」的 + 一条别处的。
+ * 抽素材（老逻辑，只给 contextFirst=false 的回滚路径用）：一条「有由头」的 + 一条别处的。
  *
  * 有由头的那条不写进文案里当解释（「他说累所以我想到…」太机械），
  * 只作为素材递给她，让她自己决定怎么用。
  *
  * 第二条要求**标签不重叠**：两条都说「宿舍」会显得她只有一件事可说。
+ *
+ * 【2026-10-24 更正】这个「标签不重叠」正是「聊着聊着就岔到别处去」的结构性原因 ——
+ * 它**保证**第二条一定和当前话题无关。新逻辑（contextFirst）不再这么补，
+ * 见 drawContextHints()。这里保留原样，只给回滚用。
  */
 function drawHints(text, used) {
   const usedSet = new Set(used || [])
@@ -207,6 +211,41 @@ function drawHints(text, used) {
     out.push(pickFrom(cands))
   }
   return out
+}
+
+/**
+ * 抽素材（2026-10-24 新逻辑）：由头命中优先，**不再强制凑一条无关的**。
+ *
+ * 和 drawHints 的差别只有两点，但正是这两点在治「总岔到别处去」：
+ * ① 默认只要 1 条（hintCount），不是 2 条 —— 少一个干扰项；
+ * ② 补第二条时**不要求标签不重叠** —— 老逻辑那样补，等于保证第二条一定是无关的。
+ *
+ * 注意：这条素材在提示里已经降级成「兜底」，主线索是上下文。
+ * 所以这里的随机性只是给「真的没什么可接」的场合留个出口。
+ */
+function drawContextHints(text, used, n) {
+  const want = Math.max(1, Math.min(3, Number(n) || 1))
+  const usedSet = new Set(used || [])
+  const pool = HINTS.filter((h) => !usedSet.has(h.text))
+  const usable = pool.length ? pool : HINTS
+
+  const matched = usable.filter((h) => h.tags.some((tag) => String(text || '').includes(tag)))
+  const pickFrom = (list) => list[Math.floor(Math.random() * list.length)]
+
+  const out = []
+  if (matched.length) out.push(pickFrom(matched))
+  while (out.length < want) {
+    const free = usable.filter((h) => !out.includes(h))
+    if (!free.length) break
+    out.push(pickFrom(free))
+  }
+  return out
+}
+
+/** 百分比配置的兜底与夹紧 */
+function pct(v, d) {
+  const n = Number(v)
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : d
 }
 
 /**
@@ -246,6 +285,15 @@ const STATE_FACTORS = {
   slot: 1,
   event: 1,
   rest: 1,
+  /*
+   * 正在刷抖音（2026-10-24 新增）。
+   *
+   * 给 0.8 而不是 1：手上确实有东西在看，但**本身就有素材可聊**
+   * （刚看到的视频），所以比闲着稍微容易岔一点，但不至于话痨。
+   * 不写这一行的话会走 fallbackByBusy(1)=0.6，等于把她当"有点忙"处理，
+   * 反而压掉了「刷到个东西想分享」这个最自然的方向。
+   */
+  douyin: 0.8,
   // 最放松
   dorm: 1.3,
   evening: 1.25,
@@ -275,6 +323,74 @@ export function stateFactor(cfg, key, busy, sneak) {
   if (sneak) return Math.max(0, pick('sneak', 0.35))
   if (key && Object.prototype.hasOwnProperty.call(table, key)) return Math.max(0, pick(key, 1))
   return fallbackByBusy(Number(busy) || 0)
+}
+
+/**
+ * 老提示词（contextFirst=false 的回滚路径）。
+ *
+ * 原文照搬 2026-10-23 那一版 —— 用户说过「不好用要能换回来」，
+ * 所以这里不做任何"顺手优化"，一个字都不改，退回去就是原来的味道。
+ */
+function legacyBlock(picks) {
+  const lines = [
+    '【这条可以不只接话（内部提示，别向对方解释这句）】',
+    '除了回他，你可以顺手想起自己的一件小事，补在后面：',
+    '- 他说的东西刚好戳到你，就讲你自己的类似经历（他说累，你也累）；也可以完全没由头地想起一件小事。',
+    '- 素材（只是提醒，别照抄，用你自己的说法）：'
+  ]
+  for (const h of picks) lines.push(`  · ${h.text}`)
+  lines.push(
+    '- **先答他说的，再岔**。别让联想把要回的话挤掉，也别一次岔两件。',
+    '- 这条要是本来一句就能说完，硬凑一件小事反而假 —— 那就别岔。',
+    '- 岔开了，可以自己发现「哎我扯远了」再拉回来，也可以不拉，看你当时想不想。'
+  )
+  return lines.join('\n')
+}
+
+/**
+ * 新提示词（contextFirst=true，默认）。
+ *
+ * 【为什么改成「先往回看」而不是「随手岔」】
+ * 用户 2026-10-24 的原话：「每次聊着聊着就扯其他的去了，显得很不礼貌。」
+ *
+ * 根因不在模型没读到上下文 —— dsh 的 session 里有完整对话，她看得到。
+ * 根因是**提示在反向鼓励**：老文本写「也可以完全没由头地想起一件小事」，
+ * 而 drawHints 又刻意补一条标签不重叠的素材，结构上保证第二个话题一定无关。
+ *
+ * 所以这里把三档优先级写死，顺序不能动：
+ *   ① 续上下文（没聊完的半截话 / 他提过没细说的 / 他一直在意的）
+ *   ② 由头命中（他说的话戳到她 → 自己的类似经历）
+ *   ③ 无关小事（兜底，且只是"可以挑"，不是"应该挑"）
+ *
+ * 关键的一句是最后那个「挑不到就别加这句，直接答完就完」——
+ * 老版本没有这个出口，等于默认她必须岔一下。
+ */
+function contextBlock(picks) {
+  const lines = [
+    '【这条可以不只接话（内部提示，别向对方解释这句）】',
+    '除了回他，你可以顺手再补一句 —— 但**先往回看一眼你们刚聊到哪儿了**：',
+    '- 有没有说到一半、还没说完的事？（他问了你没答完的、你起个头就带过去的）',
+    '- 有没有他提过、但没细说、你其实还想问的？',
+    '- 有没有他一直在意的东西？（他常提的那个项目、那门课、那个爱好）',
+    '**上面任何一条有，就接着说那个。** 这才是最自然的岔 —— 你其实还在接他的话，不是跑到别处去。'
+  ]
+
+  if (picks.length) {
+    lines.push(
+      '',
+      '实在没有可接的，才从下面挑一件你自己的小事（**兜底，不是首选**；挑不到就别加这句，答完就完）：'
+    )
+    for (const h of picks) lines.push(`  · ${h.text}`)
+  } else {
+    lines.push('', '（这次就不给无关的小事了 —— 没有可接的就别硬岔，答完就完。）')
+  }
+
+  lines.push(
+    '- **先答他说的，再岔**。别让联想把要回的话挤掉，也别一次岔两件。',
+    '- 这条要是本来一句就能说完，硬凑一件小事反而假 —— 那就别岔。',
+    '- 岔开了，可以自己发现「哎我扯远了」再拉回来，也可以不拉，看你当时想不想。'
+  )
+  return lines.join('\n')
 }
 
 /**
@@ -313,30 +429,44 @@ export function assocLine(cfg, opts = {}) {
 
   if (Math.random() * 100 >= chance) return ''
 
-  const picks = drawHints(text, s.used)
-  if (!picks.length) return ''
+  /*
+   * contextFirst 默认开；关掉 = 完全退回老行为（老提示词 + 2 条素材 + 强制不重叠）。
+   * 用户明确要求「不好用能换回来」，所以这是一条真的回滚路径，不是摆设。
+   */
+  const contextFirst = a.contextFirst !== false
 
-  const lines = [
-    '【这条可以不只接话（内部提示，别向对方解释这句）】',
-    '除了回他，你可以顺手想起自己的一件小事，补在后面：',
-    '- 他说的东西刚好戳到你，就讲你自己的类似经历（他说累，你也累）；也可以完全没由头地想起一件小事。',
-    '- 素材（只是提醒，别照抄，用你自己的说法）：'
-  ]
-  for (const h of picks) lines.push(`  · ${h.text}`)
-  lines.push(
-    '- **先答他说的，再岔**。别让联想把要回的话挤掉，也别一次岔两件。',
-    '- 这条要是本来一句就能说完，硬凑一件小事反而假 —— 那就别岔。',
-    '- 岔开了，可以自己发现「哎我扯远了」再拉回来，也可以不拉，看你当时想不想。'
-  )
+  let picks
+  let body
+  if (contextFirst) {
+    // 池子只按 poolChance 出现 —— 这就是「其他话题权重偏低」的落点
+    const poolChance = pct(a.poolChance, 30)
+    const want = Math.max(1, Math.min(3, Number(a.hintCount) || 1))
+    picks = Math.random() * 100 < poolChance ? drawContextHints(text, s.used, want) : []
+    body = contextBlock(picks)
+  } else {
+    picks = drawHints(text, s.used)
+    if (!picks.length) return ''
+    body = legacyBlock(picks)
+  }
 
+  /*
+   * streak 照旧计入 —— 包括「只给了续上下文引导、没给素材」的情形。
+   *
+   * 取舍（用户 2026-10-24 定的）：如果不计，她几乎每条都会加个尾巴，
+   * 反而更话密、更烦。宁可偶尔想接却没接上，也不要每句都挂一句。
+   */
   saveState({
     used: [...(s.used || []), ...picks.map((h) => h.text)],
     streak: s.streak + 1,
     lastAt: Date.now(),
-    last: { from: text.slice(0, 20), to: picks[0].text }
+    last: {
+      from: text.slice(0, 20),
+      to: picks[0] ? picks[0].text : '（接上文，没给素材）',
+      mode: contextFirst ? (picks.length ? 'context+pool' : 'context') : 'legacy'
+    }
   })
 
-  return lines.join('\n') + '\n'
+  return body + '\n'
 }
 
 /** 面板/日志用：最近一次联想是什么 */

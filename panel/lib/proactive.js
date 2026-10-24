@@ -3,6 +3,7 @@ import path from 'node:path'
 import { DATA_DIR, loadConfig, saveConfig } from './store.js'
 import { campusState } from './campus.js'
 import { countStickers } from './stickers.js'
+import { pending as douyinPending, noteMention as douyinMention } from './douyin-queue.js'
 
 const STATE = path.join(DATA_DIR, 'proactive.json')
 const TICK_MS = 30_000
@@ -133,6 +134,31 @@ const TOPICS = {
       '把刚才没说完的补上',
       '刚才聊到一半他 disappeared，提一嘴'
     ]
+  },
+  /**
+   * 抖音（2026-10-24 新增）。
+   *
+   * 和 continue 是同一套思路：**不进权重池**，只在条件满足时由
+   * pickDouyinTopic() 直接锁定。这里登记它只是为了：
+   *  1. 面板「主动话题」列表能显示中文标签；
+   *  2. buildPrompt 有兜底（万一 entry 拿不到，还能说句人话）。
+   *
+   * 为什么不丢进权重池：现有 9 类权重总和是 38，要让它明显占优
+   * 得填个 38 以上的数字，肉眼根本判断不出效果。
+   * 改成一个独立的概率闸（面板可调 0-100%）—— 命中率直观、可控、可关。
+   */
+  douyin: {
+    label: '聊抖音看到的',
+    when: [7, 24],
+    /**
+     * 禁止被权重池抽到（pool:false）。
+     *
+     * 它的触发权属于 pickDouyinTopic 的概率闸，不属于权重抽签。
+     * 万一以后有人往 config.weights 里塞了 douyin，或者面板加了对应输入框，
+     * 没有这个开关就会出现「绕过概率闸直接刷抖音」—— 一天三条挤在一起发。
+     */
+    pool: false,
+    hints: ['刚刷到个视频', '你发我的那个视频', '抖音上看到个事']
   }
 }
 
@@ -269,7 +295,11 @@ export function pickTopic(weights, hour, lastTopics = []) {
   const entries = Object.entries(weights || {}).filter(([k, w]) => {
     if (!(Number(w) > 0)) return false
     const t = TOPICS[k]
-    return t ? inHours(t.when, hour) : false
+    // pool:false 的话题不进权重池（抖音由概率闸单独决定），
+    // 否则 config 里一旦有了它的权重就会绕过所有频率限制。
+    // 注意判据是 `!== false` 而不是 `!t.pool` —— 后者写反了会变成
+    // 「只有标了 pool:false 的才进池」，正好反着。
+    return t ? t.pool !== false && inHours(t.when, hour) : false
   })
   if (!entries.length) return 'ask'
   const scored = entries.map(([k, w]) => {
@@ -418,6 +448,92 @@ function buildAssessPrompt() {
     '',
     '再强调一次：只输出那一行 [[对话状态]] ...，别的什么都不写。'
   ].join('\n')
+}
+
+/**
+ * 拼「聊抖音」的注入文本（2026-10-24 新增）。
+ *
+ * 关键取舍：**素材必须是具体的那一条**，不能是「刚刷到个视频」这种抽象碎片。
+ * 原因：她手上没有视频内容，只有标题和作者（采集端只读得到这些）。
+ * 给抽象碎片她只能泛泛说一句，给具体标题她才说得出「你发的那个讲 XX 的我看了」。
+ *
+ * 但也**不许她编内容** —— 提示里明写「别硬编视频里的具体细节」。
+ * 这比让她瞎编一段剧情要安全得多：编出来的东西一追问就露馅。
+ */
+function buildDouyinTalkPrompt(entry, cfg, now) {
+  const cs = campusState(cfg, now)
+  const fromHim = entry.src === 'inbound'
+  const head = entry.title ? `《${entry.title}》` : '(标题没读到)'
+  const who = entry.author ? ` @${entry.author}` : ''
+  const lines = [
+    `（内部触发：现在 ${nowLabel(now)}，你有一阵子没跟他说话了，想主动开口。）`,
+    `你现在的状态：${cs.line}。开口前先想想这个状态合不合适说话。`,
+    '',
+    fromHim
+      ? '你想起他在抖音私信里发给你的一个视频。你看过了，但一直没正经跟他聊过这个。'
+      : '你想起自己刷抖音时看到的一个视频，觉得他可能也会感兴趣，想跟他说说。',
+    '',
+    '就是这个（这是你手上全部的信息，别的基本不知道）：',
+    `  · ${head}${who}`,
+    ...(entry.url ? [`  · 链接：${entry.url}`] : []),
+    '',
+    '要求：',
+    '- 一到三句话，像平时发消息那样自然。',
+    fromHim
+      ? '- 口气是「你发的那个我看了……」，不是「我刚刷到」。这是他专门发给你的，别弄反。'
+      : '- 口气是「刚刷到个视频……」这类，是你自己看到的。',
+    '- **别硬编视频里的具体情节**。你只看到标题，说不出内容细节。说你的第一反应、',
+    '  或者问他从哪儿刷到的，都比编一段剧情强 —— 编了一追问就露。',
+    ...(entry.url
+      ? ['- 想把链接一起发过去就发，一条就够，别把链接单独甩过去不说话。不想发也不用发。']
+      : []),
+    '- 别列清单，别问「有什么可以帮你」，不要提到这条提示、也不要解释你为什么突然找他。',
+    '- 别说「我发不了链接」「我没有接口」这种话 —— 你手上就有。'
+  ]
+  return lines.join('\n')
+}
+
+/**
+ * 抖音概率闸（2026-10-24 新增）。
+ *
+ * 每次「已经决定要主动开口」之后、选题之前跑一次：
+ * 掷一次签，中了就用抖音话题，没中就回原来的权重池。
+ *
+ * 为什么不抬权重（改抬权重也很容易）：现有 9 类权重总和 38，
+ * 抖音要占到一半就得填 38，数字既不可读也不可调。
+ * 概率闸只有一个 0-100 的滑杆，命中率一眼就能算出来。
+ *
+ * 三道限制缺一不可：
+ *  - talkChance：这一轮要不要说（0 = 永不，100 = 每次都说）
+ *  - talkMinGapMin：两次抖音话题之间最少隔多久（默认 90 分钟）
+ *  - talkDailyMax：一天最多说几次（默认 3）
+ * 只留 talkChance 会连着说三条抖音，比不说还出戏。
+ *
+ * 返回 null 表示这次不说抖音。
+ */
+export function pickDouyinTopic(cfg, state, now, repliedAt = 0, rand = Math.random) {
+  const d = cfg?.douyin || {}
+  // 面板「允许她刷抖音」关掉 → 整块不生效。这是用户明确的开关
+  if (d.enabled !== true) return null
+
+  const cap = Math.max(0, Math.min(20, Number(d.talkDailyMax ?? 3)))
+  if (cap <= 0) return null
+  if ((Number(state?.dyTalkCount) || 0) >= cap) return null
+
+  const gapMin = Math.max(0, Math.min(1440, Number(d.talkMinGapMin ?? 90)))
+  const lastAt = Number(state?.dyTalkLastAt) || 0
+  if (gapMin > 0 && lastAt > 0 && now.getTime() - lastAt < gapMin * 60_000) return null
+
+  const list = douyinPending(now.getTime(), { repliedAt })
+  if (!list.length) return null
+
+  const chance = Math.max(0, Math.min(100, Number(d.talkChance ?? 70)))
+  if (chance <= 0) return null
+  if (rand() * 100 >= chance) return null
+
+  // 他专门发给她的优先于她自己刷到的 —— 前者是"指名给她"的东西
+  const fromHim = list.filter((e) => e.src === 'inbound')
+  return fromHim[0] || list[0]
 }
 
 /* ------------------------------------------------------------------
@@ -743,7 +859,9 @@ export function createProactive(proxy, logger, opts = {}) {
     const day = todayKey(now)
     let s = loadState()
     if (s.day !== day) {
-      s = { ...s, day, count: 0, hotUsed: 0, sneakCount: 0, sneakWin: '' }
+      // dyTalkCount / dyTalkLastAt 一起跨天归零 —— 抖音话题的「每天最多几次」
+      // 靠的正是这个字段，漏了就会变成「一辈子最多 3 次」
+      s = { ...s, day, count: 0, hotUsed: 0, sneakCount: 0, sneakWin: '', dyTalkCount: 0, dyTalkLastAt: 0 }
       saveState(s)
     }
     if (s.count >= (Number(p.dailyMax) || 6)) return
@@ -844,14 +962,31 @@ export function createProactive(proxy, logger, opts = {}) {
     // 明显高于其他话题的 1~3），但其他话题权重一个不动 —— 思维会发散，
     // 她仍可能不接茬而去说别的。已结束/过期/追问过 → 续聊权重归零，回到原池子。
     const w = mergedWeights(p)
-    if (convFresh && conv.ended === false && !conv.followedUp) {
-      w.continue = Math.max(w.continue || 0, Number(p.continueBoost) || 7)
+
+    /*
+     * 抖音概率闸（2026-10-24 新增）。
+     *
+     * 放在选题之前，故意不并进权重池：见 pickDouyinTopic 的注释。
+     * 命中时**跳过续聊的 boost** —— 两个都抬会分票，
+     * 而且「有具体视频要看」本来就比「接着刚才那茬」更有话说。
+     * 命中不了才回到原来的续聊判定，行为和老版本完全一致。
+     */
+    const dyEntry = pickDouyinTopic(cfg, s, now, adminLastTs)
+    let topic
+    if (dyEntry) {
+      topic = 'douyin'
     } else {
-      w.continue = 0
+      if (convFresh && conv.ended === false && !conv.followedUp) {
+        w.continue = Math.max(w.continue || 0, Number(p.continueBoost) || 7)
+      } else {
+        w.continue = 0
+      }
+      topic = pickTopic(w, now.getHours(), lastTopics)
     }
-    const topic = pickTopic(w, now.getHours(), lastTopics)
     const netLeft = (Number(p.hotDailyMax) || 0) - (s.hotUsed || 0)
-    const text = buildPrompt(topic, cfg, s, { noNet: TOPICS[topic]?.net && netLeft <= 0, now })
+    const text = dyEntry
+      ? buildDouyinTalkPrompt(dyEntry, cfg, now)
+      : buildPrompt(topic, cfg, s, { noNet: TOPICS[topic]?.net && netLeft <= 0, now })
 
     try {
       proxy.injectPrivateMessage(text, { selfId: st.botQQ || cfg.qq.botQQ })
@@ -860,12 +995,28 @@ export function createProactive(proxy, logger, opts = {}) {
       s.day = day
       s.lastTopics = [topic, ...lastTopics].slice(0, 3)
       if (TOPICS[topic]?.net && netLeft > 0) s.hotUsed = (s.hotUsed || 0) + 1
-      // 记下这次用过的素材，下次不再说同一件小事
-      const usedNow = (text.match(/^ {2}· (.+)$/gm) || []).map((x) => x.replace(/^ {2}· /, ''))
-      s.usedHints = [...(s.usedHints || []), ...usedNow].slice(-USED_MAX)
+      if (dyEntry) {
+        // 记一次「主动提过了」：ingest 类提一次就作废，inbound 类最多两次
+        s.dyTalkCount = (Number(s.dyTalkCount) || 0) + 1
+        s.dyTalkLastAt = Date.now()
+        try {
+          douyinMention(dyEntry.id)
+        } catch {
+          /* 记账失败不影响消息已经发出去这件事 */
+        }
+      } else {
+        // 记下这次用过的素材，下次不再说同一件小事
+        const usedNow = (text.match(/^ {2}· (.+)$/gm) || []).map((x) => x.replace(/^ {2}· /, ''))
+        s.usedHints = [...(s.usedHints || []), ...usedNow].slice(-USED_MAX)
+      }
       saveState(s)
       nextGap = randGap(cfg)
-      log(`主动消息已触发（${TOPICS[topic]?.label || topic}，今日第 ${s.count} 条）`)
+      log(
+        dyEntry
+          ? `主动消息已触发（聊抖音：${dyEntry.title ? `《${dyEntry.title}》` : dyEntry.id}，` +
+              `今日第 ${s.count} 条，抖音话题 ${s.dyTalkCount} 次）`
+          : `主动消息已触发（${TOPICS[topic]?.label || topic}，今日第 ${s.count} 条）`
+      )
     } catch (e) {
       log(`主动消息失败: ${e.message}`)
     }
@@ -944,6 +1095,30 @@ export function createProactive(proxy, logger, opts = {}) {
       const st = proxy.status()
       if (!st.napcat || !st.dsh) throw new Error('NapCat 或 dsh 未连接')
       const s = loadState()
+
+      // 手动点「聊抖音」时走真实队列，队列空了就明说 —— 不假装有一条
+      if (topic === 'douyin') {
+        const repliedAt =
+          typeof proxy.lastUserAtFor === 'function' ? proxy.lastUserAtFor(cfg.qq.adminQQ) : 0
+        const list = douyinPending(Date.now(), { repliedAt })
+        if (!list.length) throw new Error('待聊队列是空的（没有可聊的抖音）')
+        const fromHim = list.filter((e) => e.src === 'inbound')
+        const entry = fromHim[0] || list[0]
+        proxy.injectPrivateMessage(buildDouyinTalkPrompt(entry, cfg, new Date()), {
+          selfId: st.botQQ || cfg.qq.botQQ
+        })
+        s.lastAt = Date.now()
+        s.dyTalkCount = (Number(s.dyTalkCount) || 0) + 1
+        s.dyTalkLastAt = Date.now()
+        saveState(s)
+        try {
+          douyinMention(entry.id)
+        } catch {
+          /* ignore */
+        }
+        return { topic: 'douyin', label: TOPICS.douyin.label, title: entry.title }
+      }
+
       const t = TOPICS[topic] ? topic : pickTopic(mergedWeights(cfg.proactive), new Date().getHours(), s.lastTopics || [])
       const text = buildPrompt(t, cfg, s, { noNet: false })
       // 手动试不算条数、不扣联网额度（方便反复看效果），

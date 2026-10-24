@@ -6,5 +6,11 @@
   "checkIntervalMin": 30,
   "headless": false,
   "mute": true,
-  "showBadge": true
+  "showBadge": true,
+  "_说明2": "autoStartEdge=true：连不上 9222 时自己拉起 Edge，不用先双击任何脚本",
+  "autoStartEdge": true,
+  "_说明3": "edgeProfile 是浏览器配置目录，抖音登录态存在这里。换目录 = 要重新扫码登录",
+  "edgeProfile": "D:/EdgeDouyin",
+  "_说明4": "edgePath 留空会自动在 Program Files 的两处找；找不到才需要手填完整路径",
+  "edgePath": ""
 }

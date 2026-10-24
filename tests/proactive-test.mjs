@@ -75,7 +75,15 @@ pass('P8', '收到消息会记录活跃时段', Boolean(proxy.hook) && after ===
 // 手动试不消耗联网额度 / 不改「说过了」记录
 const info = p.info()
 pass('P9', '手动试不扣联网额度', (info.state.hotUsed || 0) === 0, `hotUsed=${info.state.hotUsed}`)
-pass('P9b', 'info 暴露 10 类话题（含续聊）', Object.keys(info.topics || {}).length === 10, `实际 ${Object.keys(info.topics || {}).length} 类`)
+// 2026-10-24：加入 douyin 后从 10 类变 11 类。
+// douyin 不进权重池（由 pickDouyinTopic 的概率闸单独决定），
+// 但登记在 TOPICS 里才能让面板显示中文标签、让 buildPrompt 有兜底。
+pass('P9b', 'info 暴露 11 类话题（含续聊、抖音）', Object.keys(info.topics || {}).length === 11, `实际 ${Object.keys(info.topics || {}).length} 类`)
+pass('P9c', '抖音不会从权重池里被抽到', (() => {
+  // 权重池里塞一个巨大的 douyin 值，也不该被 pickTopic 选中
+  for (let i = 0; i < 50; i++) if (pickTopic({ douyin: 9999, ask: 1 }, 12) === 'douyin') return false
+  return true
+})())
 
 console.log(fail ? `\n${fail} 项失败` : '\n全部通过')
 process.exit(fail ? 1 : 0)

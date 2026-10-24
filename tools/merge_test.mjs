@@ -19,7 +19,7 @@ const mk = (text, id) => ({
   self_id: 10000,
   raw_message: text,
   message: [{ type: 'text', data: { text } }],
-  sender: { user_id: 10001, nickname: '冬天不冷' },
+  sender: { user_id: 10001, nickname: '<你的抖音昵称>' },
   time: Math.floor(Date.now() / 1000)
 })
 

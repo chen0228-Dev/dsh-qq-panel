@@ -31,7 +31,7 @@ import {
 } from './lib/store.js'
 import { createProxy } from './lib/proxy.js'
 import { createProactive } from './lib/proactive.js'
-import { campusState, campusTimeline, todaysEvents, loadExtraEvents, normalizeEventsPerDay } from './lib/campus.js'
+import { campusState, campusTimeline, todaysEvents, loadExtraEvents, normalizeEventsPerDay, setTransientState } from './lib/campus.js'
 import { JOBS, templateFor } from './lib/campus-templates.js'
 import { assocInfo } from './lib/assoc.js'
 import { opinionInfo, deleteStance } from './lib/opinion.js'
@@ -49,6 +49,13 @@ import {
   saveIndex,
   todayStats
 } from './lib/stickers.js'
+import {
+  enqueue as dyEnqueue,
+  markInjected as dyMarkInjected,
+  snapshot as dySnapshot,
+  clearQueue as dyClear,
+  videoIdOf as dyVideoId
+} from './lib/douyin-queue.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(__dirname, 'public')
@@ -262,13 +269,155 @@ function douyinAuthed(req) {
  * - 别提"接口""采集""系统"这类词（会在聊天里露出机器味）
  * - 提醒她：分享过哪几条、剩下的可以留着自己聊
  */
+/**
+ * 把采集端给的 modal 链接转成标准视频链接。
+ *
+ * 采集端的 url 长这样：https://www.douyin.com/jingxuan?modal_id=7693034514264014031
+ * 那是"详情层"的地址，直接发给别人不一定能打开。
+ * 但 modal_id 的值就是 aweme_id，换成 /video/<id> 才是标准分享链接。
+ *
+ * 2026-10-24：第一版根本没把链接传给她，导致她收到"看了这些视频"却拿不出任何可分享的东西，
+ * 用户让她分享，她回"没有接口"。**根因在这里，不是接口问题。**
+ */
+function douyinShareUrl(rawUrl) {
+  const m = String(rawUrl || '').match(/(?:modal_id=|\/video\/)(\d{8,})/)
+  return m ? `https://www.douyin.com/video/${m[1]}` : ''
+}
+
+/* ------------------------------------------------------------------
+ * 「她自己去刷一轮」的触发与状态上报（2026-10-24 新增）
+ *
+ * 【为什么不能直接调用采集端】
+ * 她在服务器上，采集端在用户的 Windows 电脑上，两边没有直连。
+ * 所以只能走「留言」：服务器写一个 runAt 标记，采集端每 60 秒来拉一次配置时看到就跑。
+ *
+ * 【为什么状态必须由采集端上报】
+ * 她完全可以在对话里说「我去刷会儿抖音」，但那时候电脑可能关着。
+ * 如果只凭她一句话就把状态机改成「在刷抖音」，她就会说一件没发生的事 —— 那是编。
+ * 所以 `scrollingUntil` **只由采集端 POST 上来**，并且带超时兜底：
+ * 采集端崩了没报结束，到点自动回落，不会永远停在「在刷」。
+ * ------------------------------------------------------------------ */
+
+const RUN_FILE = path.join(DATA_DIR, 'douyin-run.json')
+
+/** 两次自发起刷之间的最小间隔（分钟）。防她一句话连刷好几轮 */
+const RUN_COOLDOWN_MIN = 5
+
+function loadRunFile() {
+  try {
+    const j = JSON.parse(fs.readFileSync(RUN_FILE, 'utf8'))
+    return { at: Number(j.at) || 0, id: String(j.id || ''), ack: String(j.ack || '') }
+  } catch {
+    return { at: 0, id: '', ack: '' }
+  }
+}
+
+function saveRunFile(d) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true })
+    fs.writeFileSync(RUN_FILE, JSON.stringify(d, null, 2), { encoding: 'utf8', mode: 0o600 })
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 电脑开着吗 —— 采集端每 60 秒拉一次配置，所以这个时间戳很新鲜 */
+const MACHINE_ALIVE_MS = 180_000
+
+function douyinReadiness(cfg) {
+  const d = cfg.douyin || {}
+  const st = getState().douyin || {}
+  const today = new Date().toISOString().slice(0, 10)
+  const used = st.day === today ? st : { likes: 0, favs: 0, shares: 0 }
+  const likeLeft = Math.max(0, (Number(d.likeLimit) || 0) - (used.likes || 0))
+  const favLeft = Math.max(0, (Number(d.favLimit) || 0) - (used.favs || 0))
+  const shareLeft = Math.max(0, (Number(d.shareLimit) || 0) - (used.shares || 0))
+  const aliveAt = Number(st.aliveAt) || 0
+
+  // 时段判断（北京时间墙上时间，和采集端用的是同一个 hm 字符串）
+  const now = new Date()
+  const hm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+  const from = d.activeFrom || '09:00'
+  const to = d.activeTo || '23:30'
+  const inWindow = from === to ? true : from < to ? hm >= from && hm <= to : hm >= from || hm <= to
+
+  const reasons = []
+  if (d.enabled !== true) reasons.push('面板上「允许她刷抖音」是关的')
+  if (!(aliveAt > 0) || Date.now() - aliveAt > MACHINE_ALIVE_MS) reasons.push('电脑没开，或者采集端没在跑')
+  if (!inWindow) reasons.push(`现在不在允许时段（${from}–${to}）`)
+  if (likeLeft <= 0 && favLeft <= 0 && shareLeft <= 0) reasons.push('今天的点赞/收藏/分享额度都用完了')
+
+  return {
+    ok: reasons.length === 0,
+    reasons,
+    machineOn: aliveAt > 0 && Date.now() - aliveAt <= MACHINE_ALIVE_MS,
+    aliveAgoSec: aliveAt > 0 ? Math.round((Date.now() - aliveAt) / 1000) : null,
+    enabled: d.enabled === true,
+    inWindow,
+    window: { from, to },
+    likeLeft,
+    favLeft,
+    shareLeft,
+    scrolling: Number(st.scrollingUntil) > Date.now()
+  }
+}
+
+/**
+ * 用户在抖音私信里发给她视频 —— 把这件事告诉她。
+ *
+ * 2026-10-24 新增。之前只做了「她发给他」的单向分享；
+ * 这一条是反向：他发过来，她"看到"，但**在 QQ 里回**（抖音里不回）。
+ *
+ * 为什么不干脆在抖音里回：那要写成双向私聊机，消息通道会分成两个
+ * （QQ 一个、抖音一个），记忆容易错位。读进来、在 QQ 里聊，只有一条主线。
+ */
+/**
+ * 现在适合插嘴吗？
+ *
+ * 2026-10-24 实测的坑：抖音注入和用户发的真实消息**同时到达**时，
+ * dsh 会把两条 user_message 合进同一个 turn，结果是两条回复互相排队等，
+ * 一条都发不出去 —— 表现就是"她说没看见""消息发不出来"。
+ *
+ * 所以注入前先看：90 秒内他刚说过话，就别打扰。宁可这条不报，也不能堵住正常聊天。
+ */
+function injectionBusy(proxy, cfg) {
+  try {
+    const last = typeof proxy.lastUserAtFor === 'function' ? proxy.lastUserAtFor(cfg.qq.adminQQ) : 0
+    return last > 0 && Date.now() - last < 90_000
+  } catch {
+    return false
+  }
+}
+
+function buildInboundPrompt(cfg, items) {
+  const lines = items.slice(0, 6).map((it, i) => {
+    const title = String(it.title || '').replace(/\s+/g, ' ').slice(0, 80)
+    const a = String(it.author || '').slice(0, 24)
+    const link = douyinShareUrl(it.url) || it.url || ''
+    const head = title ? `《${title}》` : '(没看到标题)'
+    return `${i + 1}. ${head}${a ? ' @' + a : ''}${link ? `\n   ${link}` : ''}`
+  })
+  return [
+    '【他刚在抖音给你发了个视频】',
+    ...lines,
+    '',
+    '他看到这个想到你，顺手发过来了。**你现在就在 QQ 里跟他说一句** ——',
+    '比如「这个我看了」「挺有意思的」，或者就着视频内容聊两句。',
+    '抖音那边不用回，在 QQ 里说就行。',
+    '',
+    '**别说「我没看见」「我看不到」「你发哪儿了」这种话** —— 你已经看到了，上面就是内容。',
+    '也**不要**提"消息""读取""接口"这些词。'
+  ].join('\n')
+}
+
 function buildDouyinPrompt(cfg, items, acted, today) {
   const lines = items.slice(0, 8).map((it, i) => {
     const t = String(it.title || '').replace(/\s+/g, ' ').slice(0, 60)
     const a = String(it.author || '').slice(0, 20)
     const like = Number(it.likes) || 0
     const likeText = like >= 10000 ? `${(like / 10000).toFixed(1)}w` : String(like)
-    return `${i + 1}. 《${t}》${a ? ' @' + a : ''}${like ? `（${likeText}赞）` : ''}`
+    const link = douyinShareUrl(it.url)
+    return `${i + 1}. 《${t}》${a ? ' @' + a : ''}${like ? `（${likeText}赞）` : ''}${link ? `\n   ${link}` : ''}`
   })
   const shared = Number(acted?.shared) || 0
   const liked = Number(acted?.likes) || 0
@@ -282,7 +431,11 @@ function buildDouyinPrompt(cfg, items, acted, today) {
     '',
     '现在你可以照常跟他聊天。想提就自然地说一句「刚刷到个视频」之类的，',
     '**不要**提"数据""列表""采集"这些词，也别把标题一条条念出来。',
-    '如果他问起，你再挑一两条说你在看什么。'
+    '如果他问起，你再挑一两条说你在看什么。',
+    '',
+    '**他让你分享某个视频的时候，直接把上面那一行的链接发给他就行。**',
+    '不要说"我没有分享接口""我发不了链接"——你有，链接就在每一条下面。',
+    '只发他问的那条，别一次性甩一堆链接。'
   ].join('\n')
 }
 
@@ -339,6 +492,35 @@ async function readJson(req) {
 }
 
 /* ---------------- proxy ---------------- */
+
+/*
+ * 把「她正在刷抖音」注册进状态机（2026-10-24）。
+ *
+ * campus.js 不能 import store.js（会成环），所以由这里注入。
+ * 返回 null 表示"没有临时状态"，状态机照常走日程。
+ *
+ * 判据只有一条：`state.douyin.scrollingUntil > now`。
+ * 这个时间戳**只由采集端的 /api/douyin/phase 写入** —— 她自己在对话里说
+ * 「我去刷会儿」不会改它。原因见 RUN_FILE 那段注释：不能让电脑关着时她说在刷。
+ */
+setTransientState((cfg, now) => {
+  try {
+    const st = getState().douyin || {}
+    const until = Number(st.scrollingUntil) || 0
+    if (!until || Date.now() >= until) return null
+    // 面板把这一项关掉时，即便采集端还在跑也不该说在刷
+    if (cfg?.douyin?.enabled !== true) return null
+    return {
+      key: 'douyin',
+      label: '在刷抖音',
+      busy: 1,
+      line: '你在刷抖音，手机横着拿，隔一会儿划一条；能回消息但回得不太勤，看到有意思的会想发给他'
+    }
+  } catch {
+    return null
+  }
+})
+
 const proxy = createProxy(log)
 const proactive = createProactive(proxy, log)
 
@@ -1107,7 +1289,12 @@ const server = http.createServer(async (req, res) => {
      *
      * 放在 `if (!authed(req))` 之前 —— 否则永远 401。
      */
-    if (p === '/api/douyin/config' || p === '/api/douyin/ingest') {
+    if (
+      p === '/api/douyin/config' ||
+      p === '/api/douyin/ingest' ||
+      p === '/api/douyin/inbound' ||
+      p === '/api/douyin/phase'
+    ) {
       if (!douyinAuthed(req)) return send(res, 401, { error: '采集端 token 无效' })
       const cfg = loadConfig()
 
@@ -1116,6 +1303,15 @@ const server = http.createServer(async (req, res) => {
         const st = getState().douyin || {}
         const today = new Date().toISOString().slice(0, 10)
         const usedToday = st.day === today ? st : { likes: 0, favs: 0 }
+        /*
+         * 采集端每轮开跑前都会来拉一次配置 —— 这是「他电脑开着」唯一可靠的信号。
+         *
+         * 不能用 lastAt（那是"有采集结果"的时刻）：额度用完、不在时段、
+         * 页面加载失败都不会有结果，但这些情况下电脑是开着的。
+         * 主动搭话那一层要靠 aliveAt 判断"她还刷不刷得动抖音"。
+         */
+        patchState({ douyin: { ...(getState().douyin || {}), aliveAt: Date.now() } })
+        const runReq = loadRunFile()
         return send(res, 200, {
           ok: true,
           enabled: d.enabled === true,
@@ -1132,8 +1328,109 @@ const server = http.createServer(async (req, res) => {
           likeLeft: Math.max(0, (Number(d.likeLimit) || 0) - (usedToday.likes || 0)),
           favLeft: Math.max(0, (Number(d.favLimit) || 0) - (usedToday.favs || 0)),
           shareLeft: Math.max(0, (Number(d.shareLimit) || 0) - (usedToday.shares || 0)),
+          /*
+           * 「她刚要求刷一轮」的留言板。
+           *
+           * 只有 ack !== id 时才下发 —— 采集端跑完会把 id 回执上来，
+           * 之后就不会重复触发。用 id 比较而不是清空文件，
+           * 是为了让并发/重试都幂等（清空会让第二个读到的人以为没有请求）。
+           */
+          runNow: runReq.at && runReq.ack !== runReq.id ? { id: runReq.id, at: runReq.at } : null,
           serverTime: new Date().toISOString()
         })
+      }
+
+      /*
+       * 采集端上报「我正在刷 / 我刷完了」。
+       *
+       * 这是状态机里「在刷抖音」的**唯一**来源。她自己在对话里说「我去刷会儿」
+       * 不会改这里 —— 电脑关着的时候那样说就是编。超时兜底写在 scrollingUntil 上，
+       * 采集端崩了也不会永远停在「在刷」。
+       */
+      if (p === '/api/douyin/phase' && req.method === 'POST') {
+        const body = await readJson(req)
+        const rd = getState().douyin || {}
+        const now = Date.now()
+
+        // 顺手回执 runNow：跑过一轮就把这条留言销掉
+        if (body.ackRun) {
+          const cur = loadRunFile()
+          if (cur.id && String(cur.id) === String(body.ackRun)) saveRunFile({ ...cur, ack: cur.id })
+        }
+
+        // 只有带 phase 的请求才动「在刷」状态。
+        // 单纯回执 runNow 的请求（phase 缺失）不能顺手把 scrollingUntil 清成 0 ——
+        // 那会在她正刷着的时候把状态机打回日程，自相矛盾。
+        if (body.phase === 'scrolling') {
+          const min = Math.max(1, Number(cfg.douyin?.roundMaxMin) || 10)
+          patchState({
+            douyin: { ...rd, aliveAt: now, scrollingSince: now, scrollingUntil: now + min * 60_000 }
+          })
+          /*
+           * 把状态机**当下算出来的结果**也打出来。
+           *
+           * 这不是废话日志：临时状态是靠 setTransientState 注册的，
+           * 注册失败（比如以后有人重构 server.js 把那段删了）时 phase 接口照样返回 ok，
+           * 但状态机根本没变 —— 只有打出来才看得出来。排查时一眼定位。
+           */
+          let nowKey = '?'
+          try {
+            nowKey = campusState(cfg).key
+          } catch {
+            /* 打日志失败不影响主流程 */
+          }
+          log(`采集端开始刷抖音（状态机 ${nowKey}，最多 ${min} 分钟）`)
+          return send(res, 200, { ok: true, phase: 'scrolling', until: now + min * 60_000, stateKey: nowKey })
+        }
+
+        if (body.phase === 'idle') {
+          patchState({ douyin: { ...rd, aliveAt: now, scrollingSince: 0, scrollingUntil: 0 } })
+          log('采集端刷完了，状态机回落')
+          return send(res, 200, { ok: true, phase: 'idle' })
+        }
+        // 只回执、不带 phase
+        return send(res, 200, { ok: true, acked: Boolean(body.ackRun) })
+      }
+
+      /*
+       * 用户在抖音私信里发来的视频 → 注入给她，让她在 QQ 里聊。
+       *
+       * 采集端会先去重（已经报过的不会再报），这里只负责记账 + 注入。
+       * 注意这是**读**的动作：采集端会打开消息列表找指定那个人的会话。
+       * 2026-10-24 用户明确授权了这件事（那个号只有他 + 官方通知）。
+       *
+       * 【2026-10-24 修】以前 busy 就直接丢，什么都不做 ——
+       * 而采集端是**先**把 id 写进 inbox-seen.json **再** POST 过来的，
+       * 两边一夹，那条分享永久消失（下次采集器直接跳过这个 id）。
+       * 现在改成：先入持久化队列，再尝试注入。注入失败/被跳过都不丢，
+       * 之后由主动搭话那一层补上（proactive.js 的抖音话题）。
+       */
+      if (p === '/api/douyin/inbound' && req.method === 'POST') {
+        const body = await readJson(req)
+        const items = Array.isArray(body.items) ? body.items.slice(0, 10) : []
+        if (!items.length) return send(res, 200, { ok: true, accepted: 0, injected: false })
+
+        // ① 先落盘。顺序不能反：注入是"尽力而为"，入队才是保证。
+        const q = dyEnqueue(items, 'inbound')
+        log(`收到抖音私信里的视频：${items.length} 条（待聊队列 ${q.total} 条）`)
+
+        // ② 再试着当场注入。被跳过不算失败 —— 队列里有，之后还会被提。
+        if (proxy && injectionBusy(proxy, cfg)) {
+          log('他正在聊天，这条抖音私信先不打扰（已入待聊队列，之后主动提）')
+          return send(res, 200, { ok: true, accepted: items.length, injected: false, queued: true, skipped: 'busy' })
+        }
+        let injected = false
+        if (proxy && typeof proxy.injectPrivateMessage === 'function') {
+          try {
+            proxy.injectPrivateMessage(buildInboundPrompt(cfg, items))
+            injected = true
+            // 记下注入时刻：「注入之后他回过话」就等于这条已经聊过了
+            dyMarkInjected(items.map((it) => dyVideoId(it.url) || it.id).filter(Boolean))
+          } catch (e) {
+            log(`抖音私信注入失败：${e.message}`)
+          }
+        }
+        return send(res, 200, { ok: true, accepted: items.length, injected, queued: true })
       }
 
       if (p === '/api/douyin/ingest' && req.method === 'POST') {
@@ -1152,13 +1449,36 @@ const server = http.createServer(async (req, res) => {
         d.shares = Math.max(d.shares || 0, Number(acted.shared) || 0)
         d.rounds = (d.rounds || 0) + 1
         d.lastAt = Date.now()
+        // 采集端"活着"的证据。主动那一层靠它判断电脑开没开
+        d.aliveAt = Date.now()
         patchState({ douyin: d })
 
         log(`收到抖音采集结果：${items.length} 条，点赞 ${acted.likes || 0} / 收藏 ${acted.favs || 0} / 分享 ${acted.shared || 0}`)
 
+        /*
+         * 「她自己刷到的」也进待聊队列（用户 2026-10-24 定：两个方向都要）。
+         *
+         * 但**只取前 3 条**，而且队列本身有 6 条上限 ——
+         * 一轮刷 8 条、一天刷 14 轮，全塞进去等于把队列冲成流水账，
+         * 主动搭话时抽到的反而都是刚刷到 3 分钟的，没有"回味"的味道。
+         *
+         * 注意这里**不做即时注入**，和 pushToQQ 开关解耦：
+         * 即时注入是"刷完马上说"，队列是"之后找个时机提"，两件事。
+         */
+        const top = items
+          .slice()
+          .sort((a, b) => (Number(b.likes) || 0) - (Number(a.likes) || 0))
+          .slice(0, 3)
+        const q = top.length ? dyEnqueue(top, 'ingest') : { total: 0 }
+        if (top.length) log(`她自己刷到的 ${top.length} 条也放进了待聊队列（共 ${q.total} 条）`)
+
         // 注入给她：让她"知道自己刷到了什么"，之后聊天才有素材
         let injected = false
-        if (items.length && proxy && typeof proxy.injectPrivateMessage === 'function') {
+        if (cfg.douyin && cfg.douyin.pushToQQ === false) {
+          log('「刷完主动说」是关的，这轮只记账不打扰')
+        } else if (items.length && proxy && injectionBusy(proxy, cfg)) {
+          log('他正在聊天，这轮刷抖音的结果先不打扰')
+        } else if (items.length && proxy && typeof proxy.injectPrivateMessage === 'function') {
           try {
             proxy.injectPrivateMessage(buildDouyinPrompt(cfg, items, acted, d))
             injected = true
@@ -1166,10 +1486,51 @@ const server = http.createServer(async (req, res) => {
             log(`抖音结果注入失败：${e.message}`)
           }
         }
-        return send(res, 200, { ok: true, accepted: items.length, injected, today: d })
+        return send(res, 200, { ok: true, accepted: items.length, injected, queued: !!top.length, today: d })
       }
 
       return send(res, 405, { error: '方法不支持' })
+    }
+
+    /*
+     * 「现在能不能刷」只读查询 + 「让她刷一轮」。
+     *
+     * 放在鉴权分界之前，但要**自己验两道**：
+     *  · 她的 CLI 工具（qq-douyin-run）走 loopback + internal.token；
+     *  · 面板按钮走登录会话。
+     * 只认 douyin.token 是不够的 —— 那个令牌在用户电脑上，泄露了也不该能烧额度。
+     */
+    if (p === '/api/douyin/readiness' || p === '/api/douyin/run-now') {
+      const byInternal = loopback(req) && internalAuthed(req)
+      if (!byInternal && !authed(req)) return send(res, 401, { error: '未登录' })
+
+      // 注意：这个块**在**上面那个 douyin-token 块外面，那边的作用域里的 cfg 拿不到，
+      // 必须自己 loadConfig 一次（第一版就是漏了这行，接口直接 500：cfg is not defined）
+      const dyCfg = loadConfig()
+      const rdy = douyinReadiness(dyCfg)
+      if (p === '/api/douyin/readiness' && req.method === 'GET') {
+        return send(res, 200, { ok: true, ...rdy })
+      }
+      if (p !== '/api/douyin/run-now') return send(res, 405, { error: '方法不支持' })
+      if (req.method !== 'POST') return send(res, 405, { error: '方法不支持' })
+
+      // 三道闸（开关 / 电脑在不在 / 时段 / 额度）一个都绕不过去
+      if (!rdy.ok) {
+        return send(res, 200, { ok: false, queued: false, ...rdy })
+      }
+
+      const last = loadRunFile()
+      const cdMs = RUN_COOLDOWN_MIN * 60_000
+      if (last.at && Date.now() - last.at < cdMs) {
+        const waitSec = Math.ceil((cdMs - (Date.now() - last.at)) / 1000)
+        log(`她又想刷一轮，但还在冷却里（还剩 ${waitSec} 秒）`)
+        return send(res, 200, { ok: false, queued: false, cooldown: true, waitSec, ...rdy })
+      }
+
+      const id = crypto.randomBytes(6).toString('hex')
+      saveRunFile({ at: Date.now(), id, ack: '' })
+      log(`她请求刷一轮抖音（id=${id}），等采集端来取`)
+      return send(res, 200, { ok: true, queued: true, id, ...rdy })
     }
 
     /* --- everything below requires auth --- */
@@ -1178,6 +1539,32 @@ const server = http.createServer(async (req, res) => {
     // 面板「刷抖音」卡片要显示采集端令牌，让用户复制到自己电脑的脚本里
     if (p === '/api/douyin/token' && req.method === 'GET') {
       return send(res, 200, { ok: true, token: douyinToken() })
+    }
+
+    /*
+     * 待聊队列快照（只读）+ 清空。
+     *
+     * 为什么面板要能看到这个：出问题时第一步就是判断
+     * 「是根本没进队列」还是「进了但没抽中」——
+     * 没有这个视图，只能翻日志猜，一次排查半小时起步。
+     */
+    if (p === '/api/douyin/pending' && req.method === 'GET') {
+      const cfg2 = loadConfig()
+      const repliedAt = typeof proxy.lastUserAtFor === 'function' ? proxy.lastUserAtFor(cfg2.qq.adminQQ) : 0
+      const st2 = getState().douyin || {}
+      const snap = dySnapshot(Date.now(), { repliedAt })
+      return send(res, 200, {
+        ok: true,
+        ...snap,
+        aliveAt: Number(st2.aliveAt) || 0,
+        enabled: cfg2.douyin?.enabled === true,
+        lastAt: Number(st2.lastAt) || 0
+      })
+    }
+    if (p === '/api/douyin/pending' && req.method === 'DELETE') {
+      dyClear()
+      log('待聊队列已清空（面板操作）')
+      return send(res, 200, { ok: true, items: [] })
     }
 
     /* ---------------- dsh web 反向代理 ----------------

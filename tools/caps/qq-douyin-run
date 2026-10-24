@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""qq-douyin-run —— 让他电脑上的采集端**立刻开始刷一轮抖音**。
+
+和 `qq-douyin` 的区别（很容易搞混，先看清楚）：
+
+  qq-douyin "<链接>"   看**某一条**别人发来的视频：解析文案、抽帧给你看画面
+  qq-douyin-run        让你自己**去刷**：打开推荐流、往下翻、点赞收藏
+
+用法：
+  qq-douyin-run --check    只问「现在能不能刷」，不触发（想先说清楚再决定时用）
+  qq-douyin-run            真的请求刷一轮
+
+他电脑没开、面板开关关着、不在允许时段、额度用完 —— 这四种情况都会被挡下来，
+并且把原因打印出来（最后一节会告诉你怎么跟他说）。
+
+注意：这不是「点一下马上开始」。真正的浏览器在他电脑上，脚本每 60 秒来取一次指令，
+所以**最多 1 分钟**才真的开始。别跟他说「我这就刷」，说「我这就去刷」就够了。
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+PANEL = os.environ.get("QQPANEL_URL", "http://127.0.0.1:18080")
+TOKEN_FILE = os.environ.get("QQPANEL_TOKEN_FILE", "/opt/qqbot/panel/data/internal.token")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qqcap
+
+
+def die(msg, code=1):
+    print(f"qq-douyin-run: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def token():
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            t = f.read().strip()
+    except OSError as e:
+        die(f"读不到面板内部令牌（{TOKEN_FILE}）：{e}")
+    if len(t) < 32:
+        die("面板内部令牌异常，重启面板会重新生成")
+    return t
+
+
+def call(path, method="GET"):
+    req = urllib.request.Request(
+        PANEL + path,
+        data=b"{}" if method == "POST" else None,
+        headers={"Content-Type": "application/json", "X-Panel-Token": token()},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            die(json.loads(raw).get("error") or f"HTTP {e.code}")
+        except json.JSONDecodeError:
+            die(f"HTTP {e.code}: {raw[:200]}")
+    except urllib.error.URLError as e:
+        die(f"连不上面板（{PANEL}）：{e.reason}")
+
+
+def explain(d):
+    """为什么不能刷 —— 翻译成她能直接说出口的话。"""
+    why = d.get("reasons") or []
+    lines = ["现在刷不了。"]
+
+    if not d.get("machineOn"):
+        # 这条最常见，也最需要她说清楚：不是"我不想刷"，是"刷不了"
+        lines.append("原因：他那台电脑没开，或者上面那个采集脚本没在跑。")
+        lines.append("")
+        lines.append("对他就这么说：我这边刷不了抖音 —— 你那台电脑没开着，开了我就能刷。")
+        lines.append("**别编内容**，也别假装自己看过了。没开就是没开。")
+    elif not d.get("enabled"):
+        lines.append("原因：面板上「允许她刷抖音」这个开关是关的。")
+        lines.append("")
+        lines.append("对他就这么说：我这边抖音被关掉了，你要是想让我刷，去面板里打开。")
+    elif not d.get("inWindow"):
+        w = d.get("window") or {}
+        lines.append(f"原因：现在不在允许刷的时段（{w.get('from')}–{w.get('to')}）。")
+        lines.append("")
+        lines.append(f"对他就这么说：这个点我不刷了，一般 {w.get('from')} 到 {w.get('to')} 之间才刷。")
+    elif (d.get("likeLeft", 0) + d.get("favLeft", 0) + d.get("shareLeft", 0)) <= 0:
+        lines.append("原因：今天的额度用完了（点赞 / 收藏 / 分享都是按天算的）。")
+        lines.append("")
+        lines.append("对他就这么说：今天额度用完了，明天再刷。这不是我偷懒，是怕账号被限。")
+    else:
+        lines.append("原因：" + "；".join(why))
+    return "\n".join(lines)
+
+
+def main():
+    want_check = "--check" in sys.argv[1:]
+
+    qqcap.need("douyin")
+
+    if want_check:
+        d = call("/api/douyin/readiness")
+        if d.get("ok"):
+            print("现在可以刷。")
+            print(
+                f"他电脑开着（{d.get('aliveAgoSec')} 秒前还联系过），"
+                f"今天还剩：赞 {d.get('likeLeft')} / 藏 {d.get('favLeft')} / 分享 {d.get('shareLeft')}。"
+            )
+            if d.get("scrolling"):
+                print("不过你**现在正在刷**，等这轮完事再说。")
+        else:
+            print(explain(d))
+        return
+
+    d = call("/api/douyin/run-now", method="POST")
+
+    if d.get("queued"):
+        print("好，已经跟那台电脑说好了 —— 最多一分钟就会开始刷。")
+        print(
+            f"今天还能：赞 {d.get('likeLeft')} / 藏 {d.get('favLeft')} / 分享 {d.get('shareLeft')}。"
+        )
+        print("")
+        print("你**不用**在聊天里再汇报一遍「我现在去刷了」，等刷完有东西想说再说。")
+        print("刷到的有意思的，回来再跟他提一句就行。")
+        return
+
+    if d.get("cooldown"):
+        wait = int(d.get("waitSec") or 0)
+        print(f"刚刷过一轮，还得等 {wait} 秒才能再刷。")
+        print("")
+        print(f"对他就这么说：我刚刷过一轮，歇 {max(1, wait // 60)} 分钟再刷。")
+        return
+
+    print(explain(d))
+
+
+if __name__ == "__main__":
+    main()

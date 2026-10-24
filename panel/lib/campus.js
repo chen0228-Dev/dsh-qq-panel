@@ -617,6 +617,29 @@ function labelToKey(label) {
 /* ---------------- 主函数 ---------------- */
 
 /**
+ * 临时状态钩子（2026-10-24 新增）。
+ *
+ * 【为什么用钩子而不是直接 import store】
+ * 依赖方向是 store.js → campus.js（moodLine 要用 campusState）。
+ * campus.js 再 import store.js 就成环了，Node 的 ESM 循环依赖会让其中一方拿到
+ * 半初始化的模块 —— 表现是随机 undefined，极难查。
+ *
+ * 所以反过来：campus 只暴露一个注册口，由 server.js 启动时注入。
+ * 拿不到就返回 null，**行为和没有这个功能时完全一致**（测试里不注册也不受影响）。
+ *
+ * 【为什么状态变更必须由采集端上报驱动】
+ * 不能因为她说了一句「我去刷会儿抖音」就把状态改成在刷 ——
+ * 电脑关着的时候她会说「我在刷」，但实际什么都没发生。那是编。
+ * 所以只有采集端真的开始滚动了，才 POST 上来；断了就靠超时自动回落。
+ */
+let transientGetter = null
+
+/** 注册「临时状态」来源。传 null 取消注册。getter(cfg, now) → null | {key,label,busy,line} */
+export function setTransientState(getter) {
+  transientGetter = typeof getter === 'function' ? getter : null
+}
+
+/**
  * 算出当前状态。
  * 返回 { key, label, line, busy, sneak?, windowId?, minutesLeft?, job?, age?, event? }
  * busy：0 闲 / 1 有点忙 / 2 正忙 / 3 睡了
@@ -671,6 +694,33 @@ export function campusState(cfg, now = new Date()) {
       line: late
         ? '这个点你已经睡了。真被吵醒只会很不耐烦地回一两个字，然后接着睡'
         : '你还没起，被吵醒也迷迷糊糊的，回话很短'
+    }
+  }
+
+  // ---- 2.5 临时状态：她正在刷抖音（2026-10-24 新增）----
+  //
+  // 放在睡着 / 熄灯之后、临时计划与日程之前。理由：
+  //  · 睡了就不可能还在刷 —— 不能盖过 sleep，否则半夜会说出「我在刷抖音」；
+  //  · 但「正在刷」比「她说要去写作业」「今天有课」都更具体、更新 ——
+  //    一个人完全可以边说写作业边刷手机，这时候实话是"在刷"。
+  //
+  // 钩子由 server.js 注入（见 setTransientState 的注释），拿不到就跳过。
+  if (typeof transientGetter === 'function') {
+    let tr = null
+    try {
+      tr = transientGetter(cfg, now)
+    } catch {
+      tr = null
+    }
+    if (tr && tr.line) {
+      return {
+        ...base,
+        key: tr.key || 'douyin',
+        label: tr.label || '在刷抖音',
+        busy: Number.isFinite(Number(tr.busy)) ? Number(tr.busy) : 1,
+        line: tr.line,
+        transient: true
+      }
     }
   }
 

@@ -746,6 +746,21 @@
         <p class="muted" style="margin-top:4px">每条回复给她一次「可以岔开」许可的概率。连着岔两条会自动停一轮。
           你在问具体事、求助、或者说难受的事时，她不岔；她自己在忙的时候也不岔。</p>
       </div>
+
+      <div class="switch" style="margin-top:14px"><div><div class="lab">岔开时先接刚才的话题</div>
+        <div class="sub">先回头看你们刚聊到哪儿——没说完的事、你提过没细说的、你一直在意的。有就接那个，没有才讲她自己的小事。<b>关掉 = 退回老行为（随手岔到无关小事）</b></div></div>
+        <label class="tg"><input type="checkbox" id="r-assocctx" /><span></span></label></div>
+
+      <div class="field" style="margin-top:12px" id="r-assocpoolwrap">
+        <label>凭空跳到无关小事的概率：<span class="val" id="r-assocpoollabel">30</span>%</label>
+        <input class="slider" type="range" id="r-assocpool" min="0" max="100" step="5" />
+        <p class="muted" style="margin-top:4px"><b>0 = 永远不凭空岔</b>，只在能接上下文时补一句；100 = 老版本的密度。
+          上面那个开关关掉时，这个值不生效（按 100 算）。</p>
+        <label style="margin-top:10px">兜底素材给几条</label>
+        <input class="input" id="r-assochints" type="number" min="1" max="3" />
+        <p class="muted" style="margin-top:4px">默认 1 条。老版本固定 2 条且刻意不重叠，等于保证第二个话题一定无关 —— 这是「总岔到别处」的结构性原因。</p>
+      </div>
+
       <p class="muted" id="r-assoclast">最近一次联想：—</p>
       <div class="savebar"><button class="btn" data-save="reply">保存回复设置</button><span class="saved hide">已保存</span></div>
     </div>
@@ -1023,6 +1038,8 @@
         <button class="btn ghost sm" data-run="proactive-daily">试一次 · 讲日常</button>
         <button class="btn ghost sm" data-run="proactive-hot">试一次 · 热点/梗</button>
         <button class="btn ghost sm" data-run="proactive-bored">试一次 · 闲得慌</button>
+        <!-- 试触发会去真实待聊队列取一条；队列空会明确报错，不假装有东西 -->
+        <button class="btn ghost sm" data-run="proactive-douyin">试一次 · 聊抖音</button>
       </div>
       <p class="muted" id="pa-status">—</p>
     </div>
@@ -1309,9 +1326,10 @@
         <label class="tg"><input type="checkbox" id="dy-enabled" /><span></span></label></div>
 
       <div class="field">
-        <label>分享给谁（你的抖音号）</label>
-        <input class="input" id="dy-shareto" placeholder="填抖音号，不是昵称 —— 昵称会重名认错人" />
-        <p class="muted" style="margin-top:4px">看到特别有意思的，通过抖音站内「分享给好友」发给你。<b>只发不读</b>，不碰你的消息、不自动回复。留空就不分享。</p>
+        <label>分享给谁（你的抖音昵称）</label>
+        <input class="input" id="dy-shareto" placeholder="填抖音昵称，要和分享面板里显示的一字不差" />
+        <p class="muted" style="margin-top:4px">看到特别有意思的，通过抖音站内「分享」私信发给你。<b>只发不读</b>，不碰你的消息、不自动回复。留空就不分享。<br>
+          <b>注意填昵称不填抖音号</b> —— 抖音的分享面板上显示的是昵称（比如「<你的抖音昵称>」），填号对不上。找不到这个名字就跳过，不会乱发给别人。</p>
       </div>
 
       <div class="field">
@@ -1354,6 +1372,50 @@
 
       <div class="switch" style="margin-top:14px"><div><div class="lab">刷完主动跟你说</div><div class="sub">收到结果后她可以主动开个头聊；关掉就只记账，你问起才提</div></div>
         <label class="tg"><input type="checkbox" id="dy-push" /><span></span></label></div>
+
+      <!-- 主动聊抖音的概率闸 -->
+      <div class="field" style="margin-top:14px">
+        <label>主动聊抖音的概率</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input class="input" id="dy-chance" type="range" min="0" max="100" step="5" style="flex:1" />
+          <span class="muted" id="dy-chancev" style="width:44px;text-align:right">70%</span>
+        </div>
+        <p class="muted" style="margin-top:4px">每次她要主动开口时，按这个概率决定这次聊不聊抖音。
+          <b>0 = 永远不聊</b>，100 = 每次开口都聊。调低了也不会漏，东西还在待聊队列里，只是提得少。</p>
+      </div>
+
+      <div class="field">
+        <label>抖音话题的频率限制</label>
+        <div style="display:flex;gap:12px">
+          <div style="flex:1"><input class="input" id="dy-talkgap" type="number" min="0" max="1440" /><div class="muted" style="font-size:11px">隔多少分钟才再说</div></div>
+          <div style="flex:1"><input class="input" id="dy-talkday" type="number" min="0" max="20" /><div class="muted" style="font-size:11px">一天最多几次</div></div>
+        </div>
+        <p class="muted" style="margin-top:4px">两个都得填。<b>只限次数不限间隔</b>的话，三条会挤在一起发出去，比不说还怪。</p>
+      </div>
+
+      <!-- 待聊队列：只读，出问题时先看这里 -->
+      <div class="field" style="margin-top:14px">
+        <label>待聊队列 <span class="muted" style="font-weight:400">（她还没聊过的，最新的在上面）</span></label>
+        <div id="dy-queue" class="muted" style="font-size:12px;line-height:1.7;margin-top:6px">加载中…</div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn ghost sm" id="dy-queuerefresh">刷新</button>
+          <button class="btn ghost sm" id="dy-queueclear">清空待聊</button>
+        </div>
+        <p class="muted" style="margin-top:4px">「还没聊过」的判定：<b>你发给她的</b>——注入之后你回过话就算聊过了；
+          <b>她自己刷到的</b>——主动提过一次就作废。24 小时没提自动过期。</p>
+      </div>
+
+      <!-- 立即刷一轮：本质是给采集端留个言，它 60 秒内来取 -->
+      <div class="field" style="margin-top:14px">
+        <label>让她现在刷一轮</label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn ghost sm" id="dy-runnow">立即刷一轮</button>
+          <span class="muted" id="dy-ready" style="font-size:12px">—</span>
+        </div>
+        <p class="muted" style="margin-top:4px">她自己在聊天里说「我去刷会儿」走的也是这条路（`qq-douyin-run`）。
+          采集端每 60 秒来取一次指令，所以<b>最多一分钟</b>才真的开始；真正刷的节奏不受影响。
+          开关关着、电脑没开、不在时段、额度用完都会被挡下来。</p>
+      </div>
 
       <div class="field" style="margin-top:14px">
         <label>采集端令牌（复制到你电脑上的脚本）</label>
@@ -1774,6 +1836,127 @@ let ME = null;
 /** 弹窗是门面之外的兄弟节点，一旦门被叫出来，弹窗必须收掉，否则会浮在门上 */
 function closeModals() {
   document.querySelectorAll('.modal').forEach((m) => m.classList.add('hide'));
+}
+
+/*
+ * 待聊队列面板（2026-10-24）。
+ *
+ * 为什么值得在面板上占这么一块：出问题时第一件事是分清
+ * 「根本没进队列」还是「进了但没抽中」——
+ * 没这个视图只能翻日志猜，一次排查半小时起步。
+ *
+ * 只读 + 一个清空按钮，不给编辑：队列是采集端和主动调度器共写的，
+ * 手工改容易和它们在内存里的副本打架。
+ */
+async function loadDyQueue() {
+  const box = $('dy-queue');
+  if (!box) return;
+  const cfgdy = (S && S.config && S.config.douyin) || {};
+  if (cfgdy.enabled !== true) {
+    box.innerHTML = '<span class="muted">「允许她刷抖音」是关的，队列不会累积，也不会主动提。</span>';
+    return;
+  }
+  try {
+    const d = await api('/api/douyin/pending');
+    const items = Array.isArray(d.items) ? d.items : [];
+    if (!items.length) {
+      box.innerHTML = '<span class="muted">空的。你发给她、或者她自己刷到有意思的之后，会出现在这里。</span>';
+    } else {
+      const src = (s) => (s === 'inbound' ? '你发的' : '她自己刷的');
+      const age = (m) => (m < 60 ? m + ' 分钟前' : Math.round(m / 60) + ' 小时前');
+      box.innerHTML = items
+        .map((it) => {
+          const flag = !it.available
+            ? '<span style="color:#999">（已聊过/已过期，不再提）</span>'
+            : it.mentionedCount > 0
+              ? `<span style="color:#999">（提过 ${it.mentionedCount} 次）</span>`
+              : '';
+          const t = it.title ? esc(it.title) : '（没读到标题）';
+          return `<div>· ${t}${it.author ? ' <span class="muted">@' + esc(it.author) + '</span>' : ''}
+            <span class="muted">— ${src(it.src)}，${age(it.ageMin)}</span> ${flag}</div>`;
+        })
+        .join('');
+    }
+    const alive = Number(d.aliveAt) || 0;
+    const line = alive
+      ? `采集端最后联系：${Math.round((Date.now() - alive) / 60000)} 分钟前`
+      : '采集端还没联系过（你电脑上那个脚本没在跑？）';
+    box.innerHTML += `<div class="muted" style="margin-top:6px;font-size:11px">${line}</div>`;
+  } catch (e) {
+    box.innerHTML = '<span class="muted">读取失败：' + esc(e.message || e) + '</span>';
+  }
+}
+
+/**
+ * 一行「现在能不能刷」的摘要，放在按钮旁边。
+ *
+ * 电脑开没开是这里最要紧的信息 —— 用户在面板上能一眼看到「采集端多久没联系了」，
+ * 就不用去猜为什么点了没反应。
+ */
+async function loadDyReady() {
+  const el = $('dy-ready');
+  if (!el) return;
+  try {
+    const d = await api('/api/douyin/readiness');
+    if (d.machineOn) {
+      const ago = Number(d.aliveAgoSec) || 0;
+      el.textContent = `采集端在线（${ago} 秒前联系过）· 剩 赞 ${d.likeLeft} / 藏 ${d.favLeft} / 分享 ${d.shareLeft}` +
+        (d.scrolling ? ' · 正在刷' : '');
+    } else {
+      el.textContent = '采集端没在线（电脑关了，或那个窗口被关了）';
+    }
+  } catch {
+    el.textContent = '—';
+  }
+}
+
+function bindDyQueue() {
+  const s = $('dy-chance');
+  if (s) {
+    s.addEventListener('input', () => {
+      $('dy-chancev').textContent = s.value + '%';
+    });
+  }
+  const r = $('dy-queuerefresh');
+  if (r) r.addEventListener('click', loadDyQueue);
+  const runNow = $('dy-runnow');
+  if (runNow) {
+    runNow.addEventListener('click', async () => {
+      runNow.disabled = true;
+      try {
+        const d = await api('/api/douyin/run-now', { method: 'POST' });
+        if (d.queued) {
+          $('dy-ready').textContent = '已通知采集端，最多一分钟开始';
+          toast('已通知，等它来取');
+        } else if (d.cooldown) {
+          $('dy-ready').textContent = `刚刷过，还要等 ${d.waitSec} 秒`;
+          toast('还在冷却里');
+        } else {
+          // 说清为什么不行 —— 不然按钮点了没反应最让人上火
+          $('dy-ready').textContent = (d.reasons || ['现在刷不了']).join('；');
+          toast('刷不了：' + (d.reasons || ['未知原因'])[0], 3600);
+        }
+        loadDyReady();
+      } catch (e) {
+        toast('失败：' + (e.message || e), 3600);
+      } finally {
+        runNow.disabled = false;
+      }
+    });
+  }
+  const c = $('dy-queueclear');
+  if (c) {
+    c.addEventListener('click', async () => {
+      const ok = await confirmTwice('清空待聊队列', '她之后不会再主动提这些视频');
+      if (!ok) return;
+      try {
+        await api('/api/douyin/pending', { method: 'DELETE' });
+        await loadDyQueue();
+      } catch (e) {
+        alert('清空失败：' + (e.message || e));
+      }
+    });
+  }
 }
 
 async function boot() {
@@ -2541,6 +2724,13 @@ function render() {
     const ac = Number(as.chance ?? 30);
     $('r-assocchance').value = ac;
     $('r-assoclabel').textContent = String(ac);
+    // contextFirst 默认开：老 config 里没这个字段，不能当 false
+    $('r-assocctx').checked = as.contextFirst !== false;
+    const apc = Number(as.poolChance ?? 30);
+    $('r-assocpool').value = apc;
+    $('r-assocpoollabel').textContent = String(apc);
+    $('r-assochints').value = Math.max(1, Math.min(3, Number(as.hintCount) || 1));
+    syncAssocPool();
     loadAssocLast();
   }
   // 引用
@@ -2621,6 +2811,12 @@ function render() {
     $('dy-mindur').value = Number(dy.minDuration ?? 12);
     $('dy-blockwords').value = dy.blockWords || '';
     $('dy-push').checked = dy.pushToQQ !== false;
+    $('dy-chance').value = Number(dy.talkChance ?? 70);
+    $('dy-chancev').textContent = Number($('dy-chance').value) + '%';
+    $('dy-talkgap').value = Number(dy.talkMinGapMin ?? 90);
+    $('dy-talkday').value = Number(dy.talkDailyMax ?? 3);
+    loadDyQueue();
+    loadDyReady();
   }
   $('f-t2i').checked = f.t2i;
 
@@ -2923,6 +3119,24 @@ $('r-smartmin').oninput = updateSmartLabels;
 $('r-smartmax').oninput = updateSmartLabels;
 if ($('r-pacerate')) $('r-pacerate').oninput = () => { $('r-pacerateLabel').textContent = $('r-pacerate').value; };
 if ($('r-assocchance')) $('r-assocchance').oninput = () => { $('r-assoclabel').textContent = $('r-assocchance').value; };
+/**
+ * 「先接上下文」关掉时，池子那两个参数就不生效了 —— 灰掉，别让人以为还能调。
+ * 用 gated-plain 而不是 disabled：仍然能看数值，只是明确告诉它现在不算数。
+ */
+function syncAssocPool() {
+  const on = $('r-assocctx') ? $('r-assocctx').checked : true;
+  const wrap = $('r-assocpoolwrap');
+  if (!wrap) return;
+  wrap.style.opacity = on ? '1' : '0.45';
+  const pool = $('r-assocpool');
+  const hints = $('r-assochints');
+  if (pool) pool.disabled = !on;
+  if (hints) hints.disabled = !on;
+}
+if ($('r-assocctx')) $('r-assocctx').onchange = syncAssocPool;
+if ($('r-assocpool')) {
+  $('r-assocpool').oninput = () => { $('r-assocpoollabel').textContent = $('r-assocpool').value; };
+}
 if ($('r-opinionchance')) $('r-opinionchance').oninput = () => { $('r-opinionlabel').textContent = $('r-opinionchance').value; };
 if ($('r-quotechance')) $('r-quotechance').oninput = () => { $('r-quotelabel').textContent = $('r-quotechance').value; };
 
@@ -3008,9 +3222,14 @@ async function loadAssocLast() {
   try {
     const d = await fetch('/api/assoc').then((r) => r.json());
     const last = d && d.last;
-    $('r-assoclast').textContent = last
-      ? `最近一次联想：从「${last.from || '—'}」想到「${last.to || '—'}」`
-      : '最近一次联想：还没岔过';
+    if (!last) {
+      $('r-assoclast').textContent = '最近一次联想：还没岔过';
+    } else if (last.mode === 'context') {
+      // 只给了「接上下文」的引导，没给无关素材 —— 这是新默认最常见的情形
+      $('r-assoclast').textContent = `最近一次联想：从「${last.from || '—'}」接着往下说（没给无关素材）`;
+    } else {
+      $('r-assoclast').textContent = `最近一次联想：从「${last.from || '—'}」想到「${last.to || '—'}」`;
+    }
   } catch {
     $('r-assoclast').textContent = '最近一次联想：—';
   }
@@ -3472,7 +3691,10 @@ function collect(section) {
       },
       assoc: {
         enabled: $('r-assoc').checked,
-        chance: Number($('r-assocchance').value) || 0
+        chance: Number($('r-assocchance').value) || 0,
+        contextFirst: $('r-assocctx').checked,
+        poolChance: Number($('r-assocpool').value) || 0,
+        hintCount: Math.max(1, Math.min(3, Number($('r-assochints').value) || 1))
       },
       quote: {
         enabled: $('r-quote').checked,
@@ -3512,7 +3734,10 @@ function collect(section) {
       minLikes: Number($('dy-minlikes').value) || 0,
       minDuration: Number($('dy-mindur').value) || 0,
       blockWords: $('dy-blockwords').value.trim(),
-      pushToQQ: $('dy-push').checked
+      pushToQQ: $('dy-push').checked,
+      talkChance: Number($('dy-chance').value) || 0,
+      talkMinGapMin: Number($('dy-talkgap').value) || 0,
+      talkDailyMax: Number($('dy-talkday').value) || 0
     }};
   }
   if (section === 'features') {
@@ -4702,6 +4927,7 @@ document.addEventListener('change', (e) => {
 });
 
 boot();
+bindDyQueue();
 setInterval(() => { if (S && cur === 'overview') refresh(); }, 30000);
 </script>
 </body>
