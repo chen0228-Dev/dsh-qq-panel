@@ -1298,6 +1298,71 @@
       <p class="muted" id="s-desc"></p>
       <div class="savebar"><button class="btn" data-save="search">保存搜索设置</button><span class="saved hide">已保存</span></div>
     </div>
+
+    <!-- 刷抖音 -->
+    <div class="card" data-gate="dy-enabled">
+      <h3>刷抖音</h3>
+      <div class="switch gate-head"><div><div class="lab">允许她刷抖音</div><div class="sub">采集端跑在你自己的电脑上（复用 Edge）。关掉就完全不动，<b>电脑关机也只影响这一项</b>，聊天、记忆、语音一律照常</div></div>
+        <label class="tg"><input type="checkbox" id="dy-enabled" /><span></span></label></div>
+
+      <div class="field">
+        <label>分享给谁（你的抖音号）</label>
+        <input class="input" id="dy-shareto" placeholder="填抖音号，不是昵称 —— 昵称会重名认错人" />
+        <p class="muted" style="margin-top:4px">看到特别有意思的，通过抖音站内「分享给好友」发给你。<b>只发不读</b>，不碰你的消息、不自动回复。留空就不分享。</p>
+      </div>
+
+      <div class="field">
+        <label>每天上限</label>
+        <div style="display:flex;gap:12px">
+          <div style="flex:1"><input class="input" id="dy-likelimit" type="number" min="0" max="200" /><div class="muted" style="font-size:11px">点赞</div></div>
+          <div style="flex:1"><input class="input" id="dy-favlimit" type="number" min="0" max="200" /><div class="muted" style="font-size:11px">收藏</div></div>
+          <div style="flex:1"><input class="input" id="dy-sharelimit" type="number" min="0" max="20" /><div class="muted" style="font-size:11px">分享</div></div>
+        </div>
+        <p class="muted" style="margin-top:4px">别调太高。抖音对异常频率很敏感，像真人一样少量才安全。</p>
+      </div>
+
+      <div class="field">
+        <label>单轮刷多久（分钟）</label>
+        <input class="input" id="dy-roundmax" type="number" min="1" max="60" />
+      </div>
+
+      <div class="field">
+        <label>允许刷的时段</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input class="input" id="dy-from" type="time" style="flex:1" />
+          <span class="muted">至</span>
+          <input class="input" id="dy-to" type="time" style="flex:1" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label>每轮最多滚几屏</label>
+        <input class="input" id="dy-scroll" type="number" min="5" max="100" />
+      </div>
+
+      <div class="field">
+        <label>硬筛（不花 token，纯代码判断）</label>
+        <div style="display:flex;gap:12px">
+          <div style="flex:1"><input class="input" id="dy-minlikes" type="number" min="0" /><div class="muted" style="font-size:11px">最低点赞数</div></div>
+          <div style="flex:1"><input class="input" id="dy-mindur" type="number" min="0" /><div class="muted" style="font-size:11px">最短时长（秒）</div></div>
+        </div>
+        <input class="input" id="dy-blockwords" placeholder="屏蔽词，逗号分隔（含这些词的不看）" style="margin-top:8px" />
+      </div>
+
+      <div class="switch" style="margin-top:14px"><div><div class="lab">刷完主动跟你说</div><div class="sub">收到结果后她可以主动开个头聊；关掉就只记账，你问起才提</div></div>
+        <label class="tg"><input type="checkbox" id="dy-push" /><span></span></label></div>
+
+      <div class="field" style="margin-top:14px">
+        <label>采集端令牌（复制到你电脑上的脚本）</label>
+        <div style="display:flex;gap:8px">
+          <input class="input" id="dy-token" readonly style="flex:1;font-family:var(--font-mono,monospace);font-size:11px" />
+          <button class="btn ghost sm" id="dy-tokencopy">复制</button>
+        </div>
+        <p class="muted" style="margin-top:4px">它只能读这份配置、交采集结果，<b>打不开面板、看不到聊天、改不了设置</b>。</p>
+      </div>
+
+      <div class="savebar"><button class="btn" data-save="douyin">保存抖音设置</button><span class="saved hide">已保存</span></div>
+    </div>
   </section>
 
   <!-- ============ 表情包 ============ -->
@@ -1726,6 +1791,13 @@ async function boot() {
   $('app').classList.remove('hide');
   await refresh();
   renderAccess();
+  // 抖音采集端令牌：开机拉一次就够，别每次 render 都打接口
+  try {
+    const t = await api('/api/douyin/token');
+    if ($('dy-token')) $('dy-token').value = t.token || '';
+  } catch {
+    /* 拿不到就算了，不影响别的 */
+  }
   // 支持直接打开某个页签：/#stickers —— 收藏成书签比每次点两下省事
   const want = (location.hash || '').replace(/^#/, '');
   if (want) {
@@ -2529,6 +2601,24 @@ function render() {
   $('f-stt').checked = f.stt;
   $('f-sttmodel').value = f.sttModel;
   $('f-vision').checked = f.vision;
+
+  // 刷抖音（配置可能还不存在 —— 老 config.json 没这一段，全部兜底）
+  const dy = config.douyin || {};
+  if ($('dy-enabled')) {
+    $('dy-enabled').checked = dy.enabled === true;
+    $('dy-shareto').value = dy.shareToId || '';
+    $('dy-likelimit').value = Number(dy.likeLimit ?? 15);
+    $('dy-favlimit').value = Number(dy.favLimit ?? 10);
+    $('dy-sharelimit').value = Number(dy.shareLimit ?? 3);
+    $('dy-roundmax').value = Number(dy.roundMaxMin ?? 10);
+    $('dy-from').value = dy.activeFrom || '09:00';
+    $('dy-to').value = dy.activeTo || '23:30';
+    $('dy-scroll').value = Number(dy.scrollRounds ?? 25);
+    $('dy-minlikes').value = Number(dy.minLikes ?? 100);
+    $('dy-mindur').value = Number(dy.minDuration ?? 12);
+    $('dy-blockwords').value = dy.blockWords || '';
+    $('dy-push').checked = dy.pushToQQ !== false;
+  }
   $('f-t2i').checked = f.t2i;
 
   // capabilities
@@ -3405,6 +3495,23 @@ function collect(section) {
       maxParts: Math.max(2, Math.min(12, Number($('r-splitparts').value) || 8))
     } } };
   }
+  if (section === 'douyin') {
+    return { douyin: {
+      enabled: $('dy-enabled').checked,
+      shareToId: $('dy-shareto').value.trim(),
+      likeLimit: Number($('dy-likelimit').value) || 0,
+      favLimit: Number($('dy-favlimit').value) || 0,
+      shareLimit: Number($('dy-sharelimit').value) || 0,
+      roundMaxMin: Number($('dy-roundmax').value) || 10,
+      activeFrom: $('dy-from').value || '09:00',
+      activeTo: $('dy-to').value || '23:30',
+      scrollRounds: Number($('dy-scroll').value) || 25,
+      minLikes: Number($('dy-minlikes').value) || 0,
+      minDuration: Number($('dy-mindur').value) || 0,
+      blockWords: $('dy-blockwords').value.trim(),
+      pushToQQ: $('dy-push').checked
+    }};
+  }
   if (section === 'features') {
     return { features: {
       stt: $('f-stt').checked,
@@ -3655,6 +3762,19 @@ async function loadLogs() {
   }
 }
 $('btnLogs').onclick = loadLogs;
+if ($('dy-tokencopy')) {
+  $('dy-tokencopy').onclick = async () => {
+    const v = $('dy-token').value || '';
+    if (!v) return toast('令牌还没加载出来');
+    try {
+      await navigator.clipboard.writeText(v);
+      toast('令牌已复制');
+    } catch {
+      $('dy-token').select();
+      toast('已选中，按 Ctrl+C 复制');
+    }
+  };
+}
 $('logSrc').onchange = loadLogs;
 
 /* ---------- stickers ---------- */

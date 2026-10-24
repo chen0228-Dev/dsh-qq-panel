@@ -227,6 +227,65 @@ function internalAuthed(req) {
   return safeEqual(given, internalToken())
 }
 
+/*
+ * 抖音采集端令牌。
+ *
+ * 采集端在用户电脑上，没有面板会话；也不能用 internal.token（那只给本机 root 进程）。
+ * 这个令牌只能干两件事：读刷抖音配置、提交采集结果。
+ * 拿它打不开面板、看不到聊天、改不了任何设置。
+ *
+ * 面板「刷抖音」页会显示它，用户复制到本机脚本的配置里。
+ */
+const DOUYIN_TOKEN_FILE = path.join(DATA_DIR, 'douyin.token')
+function douyinToken() {
+  try {
+    const t = fs.readFileSync(DOUYIN_TOKEN_FILE, 'utf8').trim()
+    if (t.length >= 32) return t
+  } catch {
+    /* 不存在就重建 */
+  }
+  const t = crypto.randomBytes(32).toString('hex')
+  fs.mkdirSync(DATA_DIR, { recursive: true })
+  fs.writeFileSync(DOUYIN_TOKEN_FILE, t + '\n', { mode: 0o600 })
+  return t
+}
+function douyinAuthed(req) {
+  const given = String(req.headers['x-douyin-token'] || '')
+  return given.length > 0 && safeEqual(given, douyinToken())
+}
+
+/**
+ * 把采集结果拼成一段「内部任务」，注入给她。
+ *
+ * 要点：
+ * - 明确告诉她这是**她刚刷完抖音**，不是系统日志；让她用自己的话说，别照抄字段名
+ * - 别提"接口""采集""系统"这类词（会在聊天里露出机器味）
+ * - 提醒她：分享过哪几条、剩下的可以留着自己聊
+ */
+function buildDouyinPrompt(cfg, items, acted, today) {
+  const lines = items.slice(0, 8).map((it, i) => {
+    const t = String(it.title || '').replace(/\s+/g, ' ').slice(0, 60)
+    const a = String(it.author || '').slice(0, 20)
+    const like = Number(it.likes) || 0
+    const likeText = like >= 10000 ? `${(like / 10000).toFixed(1)}w` : String(like)
+    return `${i + 1}. 《${t}》${a ? ' @' + a : ''}${like ? `（${likeText}赞）` : ''}`
+  })
+  const shared = Number(acted?.shared) || 0
+  const liked = Number(acted?.likes) || 0
+  const faved = Number(acted?.favs) || 0
+  return [
+    '【你刚刷完抖音】',
+    '下面是这一轮你看到的、觉得还行的那几条：',
+    ...lines,
+    '',
+    `这一轮你点了 ${liked} 个赞、收藏了 ${faved} 条${shared ? `、分享给他 ${shared} 条视频` : ''}。`,
+    '',
+    '现在你可以照常跟他聊天。想提就自然地说一句「刚刷到个视频」之类的，',
+    '**不要**提"数据""列表""采集"这些词，也别把标题一条条念出来。',
+    '如果他问起，你再挑一两条说你在看什么。'
+  ].join('\n')
+}
+
 
 /**
  * 这里决定了「要不要输密码」。
@@ -1039,8 +1098,87 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    /* ---------------- 抖音采集端接口（走独立 token，不走面板登录态） ----------------
+     *
+     * 采集端跑在用户的 Windows 电脑上，它没有面板会话 cookie，
+     * 也不能用 internal.token（那个只给本机 root 进程用）。
+     * 所以单独发一个 token，只干两件事：读配置、交结果。
+     * 就算泄露，也打不开面板、看不到聊天、改不了配置。
+     *
+     * 放在 `if (!authed(req))` 之前 —— 否则永远 401。
+     */
+    if (p === '/api/douyin/config' || p === '/api/douyin/ingest') {
+      if (!douyinAuthed(req)) return send(res, 401, { error: '采集端 token 无效' })
+      const cfg = loadConfig()
+
+      if (p === '/api/douyin/config' && req.method === 'GET') {
+        const d = cfg.douyin || {}
+        const st = getState().douyin || {}
+        const today = new Date().toISOString().slice(0, 10)
+        const usedToday = st.day === today ? st : { likes: 0, favs: 0 }
+        return send(res, 200, {
+          ok: true,
+          enabled: d.enabled === true,
+          activeFrom: d.activeFrom || '09:00',
+          activeTo: d.activeTo || '23:30',
+          roundMaxMin: Number(d.roundMaxMin) || 10,
+          scrollRounds: Number(d.scrollRounds) || 25,
+          minLikes: Number(d.minLikes) || 0,
+          minDuration: Number(d.minDuration) || 0,
+          blockWords: d.blockWords || '',
+          // 分享目标：用户的抖音号（采集端拿它去搜好友）。留空就不分享
+          shareToId: String(d.shareToId || '').trim(),
+          // 剩余额度：采集端自己算着用，别超
+          likeLeft: Math.max(0, (Number(d.likeLimit) || 0) - (usedToday.likes || 0)),
+          favLeft: Math.max(0, (Number(d.favLimit) || 0) - (usedToday.favs || 0)),
+          shareLeft: Math.max(0, (Number(d.shareLimit) || 0) - (usedToday.shares || 0)),
+          serverTime: new Date().toISOString()
+        })
+      }
+
+      if (p === '/api/douyin/ingest' && req.method === 'POST') {
+        const body = await readJson(req)
+        const items = Array.isArray(body.items) ? body.items.slice(0, 50) : []
+        const acted = body.acted || {}
+        const today = new Date().toISOString().slice(0, 10)
+
+        // 记账：点赞/收藏次数要落盘，否则重启就白刷了
+        const st = getState()
+        const d = st.douyin && st.douyin.day === today ? st.douyin : { day: today, likes: 0, favs: 0 }
+        // 采集端交上来的是「本轮累计」而不是「本轮增量」，
+        // 所以取 max 而不是相加 —— 它中途重试时不会把次数翻倍
+        d.likes = Math.max(d.likes || 0, Number(acted.likes) || 0)
+        d.favs = Math.max(d.favs || 0, Number(acted.favs) || 0)
+        d.shares = Math.max(d.shares || 0, Number(acted.shared) || 0)
+        d.rounds = (d.rounds || 0) + 1
+        d.lastAt = Date.now()
+        patchState({ douyin: d })
+
+        log(`收到抖音采集结果：${items.length} 条，点赞 ${acted.likes || 0} / 收藏 ${acted.favs || 0} / 分享 ${acted.shared || 0}`)
+
+        // 注入给她：让她"知道自己刷到了什么"，之后聊天才有素材
+        let injected = false
+        if (items.length && proxy && typeof proxy.injectPrivateMessage === 'function') {
+          try {
+            proxy.injectPrivateMessage(buildDouyinPrompt(cfg, items, acted, d))
+            injected = true
+          } catch (e) {
+            log(`抖音结果注入失败：${e.message}`)
+          }
+        }
+        return send(res, 200, { ok: true, accepted: items.length, injected, today: d })
+      }
+
+      return send(res, 405, { error: '方法不支持' })
+    }
+
     /* --- everything below requires auth --- */
     if (!authed(req)) return send(res, 401, { error: '未登录' })
+
+    // 面板「刷抖音」卡片要显示采集端令牌，让用户复制到自己电脑的脚本里
+    if (p === '/api/douyin/token' && req.method === 'GET') {
+      return send(res, 200, { ok: true, token: douyinToken() })
+    }
 
     /* ---------------- dsh web 反向代理 ----------------
      * 把服务器本机的 dsh web（127.0.0.1:3080）嵌进面板，点开就能看。

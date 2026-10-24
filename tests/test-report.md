@@ -4376,3 +4376,102 @@ cp /opt/qqbot/_bak/1024-1111-campus-off-flavor/index.html /opt/qqbot/panel/publi
 cp /opt/qqbot/_bak/1024-1111-campus-off-flavor/AGENTS.md /root/qq-workspace/
 systemctl restart qqbot-panel
 ```
+
+---
+
+## 六十一、刷抖音（采集端在本机，2026-10-24）
+
+### 需求
+
+让她自己刷抖音、点攒、收藏、把有意思的分享给用户，并且能看到她在操作。
+
+用户明确**不做私聊**（承认技术限制）。
+
+### 为什么必须拆成两端
+
+审计后的硬约束：
+
+| | 服务器 | 用户电脑 |
+|---|---|---|
+| 可用内存 | **584MB**（实测，已用 1156/1740） | 8G+ |
+| 浏览器 | **一个都没装** | Edge |
+| 能做什么 | 发配置、收结果、注入 | 真刷、点赞、收藏、分享 |
+
+- 服务器开无头 Chrome 要 500–800MB → 直接吃 swap，把 dsh 和 NapCat 拖死
+- 点赞/收藏/分享是**写操作**，抖音只读接口给不了，必须真浏览器带登录态
+- 所以：**采集端在本机，大脑和记忆在服务器**
+
+**关键边界（用户特意确认过）**：电脑关机 = 今天不刷抖音，聊天/记忆/语音/主动搭话一律照常。
+能力缺失 ≠ 故障。
+
+### 实现
+
+**服务器端**（本次改）
+
+| 文件 | 改动 |
+|---|---|
+| `lib/store.js` | 新增 `douyin` 配置段（开关/额度/时段/硬筛/分享目标） |
+| `server.js` | `GET /api/douyin/config`、`POST /api/douyin/ingest`、`GET /api/douyin/token`、`buildDouyinPrompt()`、`douyinToken()/douyinAuthed()` |
+| `public/index.html` | 功能页新增「刷抖音」卡片 + render/collect + token 复制 |
+
+**鉴权**：两个采集接口用**独立令牌**（`panel/data/douyin.token`，600），
+放在 `if (!authed(req))` **之前**（否则采集端永远 401）。
+令牌只能读配置、交结果 —— 打不开面板、看不到聊天、改不了设置。
+
+**采集端**（`tools/douyin/`）
+
+- `start-edge.bat`：独立配置目录 + `--remote-debugging-port=9222` 的专用 Edge
+- `collect.mjs`（363 行）：CDP 连上去 → 拉配置 → 滚推荐页 → 硬筛 → 点赞/收藏/分享 → 交回
+- `config.example.json` / `README.md`
+
+### 刻意的设计
+
+1. **额度由服务器下发**，`likeLeft/favLeft/shareLeft` 归零就停，本地不加量
+2. **点不到就跳过**：每类信息给多个候选选择器，全拿不到就跳过（抖音 DOM 常变）
+3. **滚动/点击间隔随机 2.5–6s**，不是匀速机器
+4. **分享只发不读**，走抖音自己的分享面板
+5. **默认静音**，否则电脑突然放抖音
+6. **右下角角标**「她正在看：xxx」—— 能看到页面自己滚/自己点，
+   但**系统鼠标不会动**（CDP 是程序化点击，不经过光标）
+
+### 一个脱敏事故（自己犯的）
+
+第一版 `buildDouyinPrompt()` 里把用户昵称硬编码进了注入文案（"分享给晨晨 N 条"），
+这会直接进开源仓库。发现后立即改成「分享给他 N 条视频」。
+
+> 教训：**写进提示词/注入文本的字面量，和写进代码注释的一样危险**。
+> 开源前 `grep` 敏感词要连 `server.js` 里的模板字符串一起扫。
+
+另外 `config.example.json` 第一版把真实服务器 IP 写进去了，改成 `<你的服务器IP>`。
+
+### 验证
+
+- `node --check` 三个文件全过
+- 接口实测：
+  - 无 token → **401**（config 和 ingest 都是）
+  - 带 token → **200 + 正确 JSON**（`likeLeft 15 / favLeft 10 / shareLeft 3`）
+  - ingest 空 items → `{"ok":true,"accepted":0,"injected":false}`，
+    `state.json` 写入 `douyin:{day,likes,favs,shares,rounds,lastAt}`
+- 面板：刷抖音卡片、`dy-enabled`/`dy-shareto`/`dy-token` 全部上线
+- 面板重启后 `已连接 dsh` + `NapCat 已接入`
+
+### 没验证的（重要）
+
+- **采集脚本没有真跑过**。需要用户的电脑 + 已登录 Edge + 装 playwright-core。
+  抖音网页版的 DOM 选择器是**按当前结构推测的**，很可能要按实际页面调。
+  所以脚本设计成「拿不到就跳过」而不是「硬点」。
+- 分享给指定抖音号的流程（分享面板 → 私信 → 搜号 → 发送）同样没实测。
+- 没有真实注入测试（空 items 故意不触发注入，避免打扰用户）。
+
+### 面板默认值
+
+`enabled: false` —— 装完不会自己动，要用户在面板上打开。
+
+### 回滚
+
+```bash
+cp /opt/qqbot/_bak/1024-1154-douyin/* /opt/qqbot/panel/ 2>/dev/null
+cp /opt/qqbot/_bak/1024-1154-douyin/store.js /opt/qqbot/panel/lib/
+cp /opt/qqbot/_bak/1024-1154-douyin/index.html /opt/qqbot/panel/public/
+systemctl restart qqbot-panel
+```

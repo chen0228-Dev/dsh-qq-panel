@@ -1,0 +1,10 @@
+{
+  "_说明": "复制成 config.json 再填。token 在面板「功能 → 刷抖音」页里点复制",
+  "server": "http://<你的服务器IP>:18080",
+  "token": "粘贴面板里的采集端令牌",
+  "cdpPort": 9222,
+  "checkIntervalMin": 30,
+  "headless": false,
+  "mute": true,
+  "showBadge": true
+}
