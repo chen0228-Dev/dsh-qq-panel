@@ -95,6 +95,27 @@ export function planPace(cfg, ctx = {}) {
 
   if (p.enabled === false) return { delayMs: 0, band: 'instant', skip: false }
 
+  /*
+   * 状态机关闭 = 「随时在线」。
+   *
+   * 这时候她不该有任何「在忙 / 在睡 / 刚醒」的概念，所以整套分档逻辑
+   * （instantRate / mix / nightSlow / busy 抬档）一律不参与 ——
+   * 尤其 nightSlow 是唯一还在**按钟点**变慢的地方，关掉状态机后它必须失效，
+   * 否则会出现「面板说没有状态，凌晨却还是拖 6 分钟」这种自相矛盾。
+   *
+   * 但也不能真的 0 延迟（那是机器人特征）。改成一个「打字延迟」：
+   * 按字数估，80ms 一个字，夹在 800ms ~ 3s 之间，再加一点抖动。
+   * 短句不秒出，长句也不会拖到让人以为掉线。
+   *
+   * 注意顺序：这一步在 p.enabled 判断**之后** ——
+   * 「生活节奏」总开关仍然是最高优先级，关掉它就是 0 延迟，尊重那个语义。
+   */
+  if (cfg?.campus?.enabled === false) {
+    const n = Math.max(0, Number(ctx.chars) || 0)
+    const base = Math.min(3000, Math.max(800, n * 80))
+    return { delayMs: Math.max(300, Math.round(base + rand(-150, 400))), band: 'typing', skip: false }
+  }
+
   // 正在聊：只做打字级的微延迟，绝不能拖到分钟
   if (ctx.chatting) {
     return { delayMs: Math.round(rand(1200, 6000)), band: 'instant', skip: false }

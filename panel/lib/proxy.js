@@ -2152,7 +2152,10 @@ class Proxy {
       chatting,
       unanswered: st.skipped,
       // 上课/自习/睡着了：状态机给出忙闲等级，节奏层据此抬档
-      busy: cs.busy
+      busy: cs.busy,
+      // 状态机关闭时节奏层改按「字数估打字时间」，所以要把长度带过去。
+      // 用去标点前的 plain.length：标点和空格也是要打出来的
+      chars: plain.length
     })
 
     if (lowValue && cfg.reply?.pace?.skipLowValue !== false && !chatting) {

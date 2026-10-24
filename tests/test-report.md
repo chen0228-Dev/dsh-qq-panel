@@ -4277,3 +4277,102 @@ cp /opt/qqbot/_bak/1023-2242-coalesce-smart/index.html /opt/qqbot/panel/public/
 cp /opt/qqbot/_bak/1023-2242-coalesce-smart/config.json /opt/qqbot/panel/data/
 systemctl restart qqbot-panel
 ```
+
+---
+
+## 六十、关掉状态机 = 随时在线；反问率与允许走独立（2026-10-24）
+
+### 一、用户报的问题
+
+「关掉状态机后不应该退回按钟点给状态，应该保持随时在线，但回复还是要有延迟。」
+
+审计后发现，**他看到的「按钟点给状态」是面板上一句过期文案**，实际代码里早就没有这个 fallback 了：
+
+```
+index.html:589  「关掉就退回按钟点给状态（困/刚醒/在忙）」  ← 说谎，旧版 moodLine 才有
+实测 moodLine(campus.enabled=false) → ""（什么都不注入）
+```
+
+但顺着查出**两个真问题**：
+
+| 问题 | 位置 | 后果 |
+|---|---|---|
+| `nightSlow`（0–7 点强制抬档）跟状态机无关 | `pacing.js:94` | 关掉状态机后，凌晨照样拖 2–6 分钟 |
+| `BANDS.instant = [0,0]` + `instantRate=90` | `pacing.js` | 90% 消息 **0 毫秒**回复，比开着状态机还快 |
+
+### 二、改法
+
+`pacing.js#planPace` 新增分支（放在 `pace.enabled === false` 判断**之后**，
+保证「生活节奏」总开关仍是最高优先级）：
+
+```js
+if (cfg?.campus?.enabled === false) {
+  const n = Math.max(0, Number(ctx.chars) || 0)
+  const base = Math.min(3000, Math.max(800, n * 80))
+  return { delayMs: base + rand(-150, 400), band: 'typing', skip: false }
+}
+```
+
+- 跳过分档、`nightSlow`、`busy` 抬档
+- 0.8–3 秒按字数估打字时间
+- `proxy.js` 把 `chars: plain.length` 传进去
+- 面板文案改成如实描述
+
+### 三、顺带修的子 Agent 审计发现（「说话的味道」卡）
+
+子 Agent 独立审计了「反问机制」+「说话的味道」5 个控件，结论：**没有死开关**，但有 4 个真 bug：
+
+| # | Bug | 改法 |
+|---|---|---|
+| 1 | 「反问率」「允许走」嵌在 `if (human > 0)` 里，活人味=0 就整段消失 | 两段提到活人味外面独立判断 |
+| 2 | 活人味 55/80 档自带「反问一句」「干脆反问回去」，把 `askBack=0` 抵消 | 这两句改成 `if (askBack > 0)` 才加 |
+| 3 | `askBack=0` 时提示词里没有任何禁令，模型自由发挥 | 新增独立段「## 别反问」 |
+| 4 | 档位错位：UI ≤35/≤70，后端 ≤20/≤60，拖到 61 悄悄进最激进档 | 统一为 0 / 1–33 / 34–66 / 67–100，UI 与后端同步 |
+
+顺带改准了两处文案：卡片头（说明五项各写进哪一段，原文只提两项）、
+`p-mood` 的说明（补「状态机没启用时自动无效」）。
+
+### 四、测试踩的两个坑（都不是产品代码的问题）
+
+1. `buildPersona` 的测试 cfg 忘了 `persona.enabled` → `renderPersona` 第一行
+   `if (!p.enabled) return '# 人格设定已关闭'` 直接早退，测出来「反问段消失」全是假象。
+2. `mk()` 里 `...o` 放在最后，把整个 `persona` 对象覆盖了（只剩 human/askBack），
+   `enabled` 又被冲掉。
+3. 补上后还崩了一次：`cfg.paths.workspace` 未定义 —— `renderPersona` 末尾要拼
+   「长期记忆在 <workspace>/AGENTS.local.md」，**少这个字段是抛异常，不是返回空**。
+
+> 教训：测 `renderPersona` 的 cfg 至少要给 `persona.enabled / paths.workspace`，
+> 否则测的是「早退分支」，看起来什么都对，实际什么都没测。
+
+### 五、验证
+
+- 新增 `tests/flavor-test.mjs` **34 项全过**（本地 + 服务器）
+  - [1][2] 状态机关闭：4 个时间点都是 typing 档、不受 hour 影响；对比凌晨睡着档 >8 分钟
+  - [3] 打字延迟随字数增长且封顶
+  - [4] `pace.enabled=false` 仍返回 0 延迟（优先级正确）
+  - [5] human=0 时反问段/会走段仍在
+  - [6] human=30/60/90 + askBack=0 → 无「反问一句」残留 + 有「## 别反问」
+  - [7] 四档边界 0/1/33/34/66/67/100 全部正确
+  - [8] canLeave 可单独关
+- 回归：internal-mark 20、coalesce-smart 45、double-confirm 20、slang 74、
+  sticker-switch、campus 全部通过
+- 线上：重启后 `已连接 dsh` + `NapCat 已接入`；AGENTS.md 含「别只会答，也要问」
+  「你也可以走」各 1 处；面板旧文案已消失
+
+### 六、没做的 / 已知残留
+
+- **用户的 `campus.enabled` 现在是 `true`**，所以新逻辑要等他关掉状态机才生效。
+- `persona.maxChars`（单条上限）仍然纯靠提示词、无代码截断，且会被分条放宽到 5 倍。
+  面板已写明，属已知取舍。
+- 「反问率」滑杆 step=5，1–33 之间有 6 个刻度输出相同 —— 这是滑杆形态的固有现象，
+  不打算改成下拉（会动太多前端），但 0 与 5 分属不同档，UI 已标注。
+- 没在真 QQ 里对话验证「0.8–3 秒」的体感。
+
+### 七、回滚
+
+```bash
+cp /opt/qqbot/_bak/1024-1111-campus-off-flavor/*.js /opt/qqbot/panel/lib/
+cp /opt/qqbot/_bak/1024-1111-campus-off-flavor/index.html /opt/qqbot/panel/public/
+cp /opt/qqbot/_bak/1024-1111-campus-off-flavor/AGENTS.md /root/qq-workspace/
+systemctl restart qqbot-panel
+```

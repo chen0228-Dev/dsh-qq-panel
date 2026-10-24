@@ -522,7 +522,7 @@
 
     <div class="card">
       <h3>说话的味道</h3>
-      <p class="hint">让它更像一个真人，而不是客服。这两项会写进 AGENTS.md 的「说话要像个真人」和「说脏话的尺度」两段，保存后下一句话就生效。</p>
+      <p class="hint">让它更像一个真人，而不是客服。下面五项各写各的一段，互不覆盖，保存后下一句话就生效：活人味和脏话进 AGENTS.md 的对应段落，反问率进「别只会答，也要问」，允许结束对话进「你也可以走」，心情按条注入不进 AGENTS.md。</p>
       <div class="field">
         <label>活人味：<span class="val" id="p-humanlabel">随意</span></label>
         <input type="range" class="slider" id="p-human" min="0" max="100" step="5" />
@@ -554,7 +554,7 @@
 
       <div class="switch" style="margin-top:8px"><div><div class="lab">允许它主动结束对话</div><div class="sub">「我先去忙了」「睡了 明天说」——会走，才会回来</div></div>
         <label class="tg"><input type="checkbox" id="p-leave" /><span></span></label></div>
-      <div class="switch" style="margin-top:8px"><div><div class="lab">根据不同的状态和心情更改语气</div><div class="sub">告诉她「你现在什么状态」，让她说话的语气跟着变（困了就短、忙了就少话）。只管<b>怎么说</b>，不管<b>多快回</b>——回得快慢看上面「生活节奏」</div></div>
+      <div class="switch" style="margin-top:8px"><div><div class="lab">根据不同的状态和心情更改语气</div><div class="sub">告诉她「你现在什么状态」，让她说话的语气跟着变（困了就短、忙了就少话）。只管<b>怎么说</b>，不管<b>多快回</b>——回得快慢看上面「生活节奏」。<b>状态机没启用时这项自动无效</b>（没有状态可注入）</div></div>
         <label class="tg"><input type="checkbox" id="p-mood" /><span></span></label></div>
 
       <div class="savebar"><button class="btn" data-save="flavor">保存</button><span class="saved hide">已保存</span></div>
@@ -586,7 +586,7 @@
       <h3>身份与日程</h3>
       <p class="hint">这里定的是她<b>真实的日常</b>，不是角色扮演。保存后会写进 AGENTS.md，并驱动上面那张「她现在在干嘛」：
       忙、闲、睡着会直接改变她回你的速度和字数。</p>
-      <div class="switch gate-head"><div><div class="lab">启用状态机</div><div class="sub">关掉就退回按钟点给状态（困/刚醒/在忙）</div></div>
+      <div class="switch gate-head"><div><div class="lab">启用状态机</div><div class="sub">关掉后她不再有「在忙 / 在睡 / 刚醒」这类状态，任何时候都当在线处理；回复快慢改按字数估打字时间（0.8–3 秒），不再跟钟点走</div></div>
         <label class="tg"><input type="checkbox" id="cp-enabled" /><span></span></label></div>
 
       <!-- 第一层：她是谁 -->
@@ -2779,7 +2779,7 @@ function updateHumanLabel(n) {
   const d = $('p-humandesc');
   if (!d) return;
   if (n <= 5) {
-    d.textContent = '关掉了。句子完整、用词干净，像一个有礼貌但不熟的人。';
+    d.textContent = '关掉了。句子完整、用词干净，像一个有礼貌但不熟的人。注意：反问率和「允许走」是独立开关，这里关掉不影响它们。';
   } else if (n <= 35) {
     d.textContent = '说话基本完整，但会带一点语气词和省略。';
   } else if (n <= 65) {
@@ -2789,18 +2789,24 @@ function updateHumanLabel(n) {
   }
 }
 
-/** 反问率的说明：这个数字直接决定 AGENTS.md 里「别只会答，也要问」那段的强度 */
+/**
+ * 反问率的说明：这个数字直接决定 AGENTS.md 里「别只会答，也要问」那段的强度
+ *
+ * 【阈值必须和 store.js 严格一致】后端按 0 / 1-33 / 34-66 / 67-100 切四段。
+ * 以前这里写的是 ≤5 / ≤35 / ≤70，后端却是 ≤20 / ≤60 ——
+ * 拖到 61~70 时面板嘴上说「正常」，提示词里已经是最激进那档了。
+ */
 function updateAskBackDesc(n) {
   n = Number(n) || 0;
   const el = $('p-askbacklabel');
-  if (el) el.textContent = n <= 5 ? '只答不问' : n <= 35 ? '偶尔问' : n <= 70 ? '正常' : '爱追问';
+  if (el) el.textContent = n === 0 ? '只答不问' : n <= 33 ? '偶尔问' : n <= 66 ? '正常' : '爱追问';
   const d = $('p-askbackdesc');
   if (!d) return;
-  if (n <= 5) {
-    d.textContent = '完全不反问。你问什么它答什么——这也是最像客服的一种。';
-  } else if (n <= 35) {
+  if (n === 0) {
+    d.textContent = '完全不反问。你问什么它答什么——这也是最像客服的一种。注意：0 和 5 是两个不同的档，不是渐变。';
+  } else if (n <= 33) {
     d.textContent = '偶尔抛一句「你呢」「后来呢」，大部分时候顺着你的话说。';
-  } else if (n <= 70) {
+  } else if (n <= 66) {
     d.textContent = '会主动追问细节、问你的看法。正常朋友聊天的比例大概在这。';
   } else {
     d.textContent = '话多、爱追问。注意别调太满，会变成查户口。';
