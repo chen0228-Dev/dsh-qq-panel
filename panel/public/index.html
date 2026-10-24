@@ -1300,7 +1300,10 @@
     </div>
 
     <!-- 刷抖音 -->
-    <div class="card" data-gate="dy-enabled">
+    <!-- 刻意不用 data-gate：那套的语义是「开关关了就把卡内控件全禁用」，
+         但这张卡得能「先把参数配好、再打开开关」，一关就灰掉会让用户配不了。
+         开关只控制「采集端要不要跑」，不控制「能不能编辑」。 -->
+    <div class="card">
       <h3>刷抖音</h3>
       <div class="switch gate-head"><div><div class="lab">允许她刷抖音</div><div class="sub">采集端跑在你自己的电脑上（复用 Edge）。关掉就完全不动，<b>电脑关机也只影响这一项</b>，聊天、记忆、语音一律照常</div></div>
         <label class="tg"><input type="checkbox" id="dy-enabled" /><span></span></label></div>

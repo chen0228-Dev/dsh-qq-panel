@@ -2633,22 +2633,44 @@ collect.mjs ── GET  /api/douyin/config ──→ 读开关 + 额度
 两个接口走**独立令牌**（`panel/data/douyin.token`，权限 600），不用面板登录态。
 这个令牌只能读配置、交结果 —— 拿它打不开面板、看不到聊天、改不了任何设置。
 
-### 部署步骤
+### 部署步骤（2026-10-24 已在本机搭好）
+
+本机情况：Edge 在 `C://Program Files (x86)\Microsoft\Edge\Application\msedge.exe`，
+专用配置目录 `D://ccPrograms//EdgeDouyin`，`playwright-core` 已装。
+
+**桌面上有三个 bat，日常只用这三个：**
+
+| 桌面文件 | 干什么 |
+|---|---|
+| `抖音-启动专用Edge.bat` | 起带调试口 9222 的 Edge（独立配置目录）。**第一次要扫码登录抖音** |
+| `抖音-自检.bat` | 检查环境（Node/依赖/config/服务器/CDP/登录态），只读不点任何按钮 |
+| `抖音-让她刷一轮.bat` | 跑一轮采集 |
+
+**顺序**：先启动 Edge → 扫码登录 → 自检全绿 → 再点「让她刷一轮」。
+
+想让它在后台一直跑：在那个目录下 `node collect.mjs --loop`，默认每 30 分钟看一次面板开关。
+
+**手动部署（换机器时）**
 
 ```bash
-# 1. 起专用 Edge（独立配置目录，不碰日常书签/密码）
-tools/douyin/start-edge.bat        # 首次扫码登录抖音
-
-# 2. 装依赖（playwright-core，不下载浏览器）
-cd tools/douyin && npm i playwright-core
-copy config.example.json config.json
-
-# 3. 填 server（服务器地址）和 token（面板「刷抖音」页里复制）
-
-# 4. 跑
-node collect.mjs           # 一轮
-node collect.mjs --loop    # 常驻
+cd tools/douyin
+npm i playwright-core                 # 只装驱动，不下载浏览器（不占 150MB）
+copy config.example.json config.json  # 填 server 和 token
+node doctor.mjs                       # 自检
 ```
+
+#### 配置文件不进仓库
+
+`tools/douyin/config.json` 里是**真实服务器地址 + 采集令牌**。
+它已被 `生成发布包.sh` 的 `--exclude` 挡在外面，别去掉那条规则。
+
+#### 面板卡片不会因为开关关掉而变灰
+
+这张卡**刻意没有用 `data-gate`**。面板里其他卡片是「总开关关掉 → 卡内控件全禁用」，
+但这张需要「先配好参数、再打开开关」，所以开关只控制采集端要不要跑，不控制能不能编辑。
+
+> 2026-10-24 踩过：第一版用了 `data-gate="dy-enabled"`，
+> 结果用户一点保存、卡片整片变灰、按钮也点不动 —— 因为他当时开关还是关的。
 
 ### 面板上能调什么
 
@@ -2690,6 +2712,8 @@ node collect.mjs --loop    # 常驻
 | 采到 0 条 | 抖音改版，选择器失效 —— 看日志里的「跳过」原因 |
 | 一直「无文案」跳过 | 登录态掉了，页面停在登录引导页 |
 | 分享一直失败 | 搜不到那个号，确认填的是**抖音号**不是昵称 |
+| 卡片变灰、按钮点不动 | 旧版本问题，已修（去掉 `data-gate`）。刷新页面即可 |
+| 想把结果发到抖音但没反应 | 面板「分享给谁」没填。填**抖音号**，不是昵称 |
 
 ---
 

@@ -4475,3 +4475,75 @@ cp /opt/qqbot/_bak/1024-1154-douyin/store.js /opt/qqbot/panel/lib/
 cp /opt/qqbot/_bak/1024-1154-douyin/index.html /opt/qqbot/panel/public/
 systemctl restart qqbot-panel
 ```
+
+---
+
+## 六十二、修「刷抖音卡片变灰」+ 本机采集端落地（2026-10-24）
+
+### 一、报障
+
+用户在面板保存「刷抖音」后，**整张卡片变灰、按钮点不动**。
+
+### 二、根因
+
+卡片上写了 `data-gate="dy-enabled"`。面板的 `applyGates()` 语义是：
+
+```js
+document.querySelectorAll('[data-gate]').forEach((card) => {
+  const sw = $(card.dataset.gate)
+  if (sw) card.classList.toggle('gated', !sw.checked)   // 开关关了 → 整卡 gated
+})
+```
+
+`gated` 会让卡内控件全部禁用。而那时候 `enabled` 还是 `false`（他还没打开开关），
+于是点保存 → 重新 render → applyGates → 整片灰掉，连改参数都改不了。
+
+**设计错误**：这张卡需要「先配好参数，再打开开关」，跟「总开关关了就别动其它设置」的语义相反。
+
+**改法**：去掉 `data-gate`，并在 HTML 里写清为什么不用它。
+
+### 三、本机采集端落地（这台机器）
+
+| 项 | 值 |
+|---|---|
+| Edge | `C:/Program Files (x86)\Microsoft\Edge\Application\msedge.exe`（Edg/155.0.4283.62） |
+| 专用配置目录 | `D:/ccPrograms/EdgeDouyin`（与日常 Edge 完全隔离） |
+| 依赖 | `playwright-core`（只装驱动，不下载浏览器） |
+| 配置 | `tools/douyin/config.json`（真实地址 + 令牌，**已加 `--exclude` 不进仓库**） |
+| 桌面 | `抖音-启动专用Edge.bat` / `抖音-自检.bat` / `抖音-让她刷一轮.bat` |
+
+**实测链路**：
+
+- CDP `127.0.0.1:9222/json/version` → `Edg/155.0.4283.62`
+- `chromium.connectOverCDP()` 接管成功，1 个上下文、1 个页面，
+  页面已停在 `douyin.com/jingxuan`
+- 本机 → 服务器 `/api/douyin/config` 通，返回 `enabled:true`、剩余额度 15/10/3
+- `doctor.mjs` 六项自检全绿
+
+### 四、新增自检脚本
+
+`tools/douyin/doctor.mjs`：Node / 依赖 / config / 服务器连通 / CDP / 登录态，六项只读检查。
+**不点任何按钮、不发任何消息**，失败时给具体下一步。
+
+### 五、两个安全问题（都在提交前挡住）
+
+1. **`config.json` 含真实令牌** → 已加进 `生成发布包.sh` 的 `--exclude`（连同 package.json、
+   package-lock.json），否则下次生成会把令牌打进开源包。
+2. **config.json 里写了真实服务器 IP** → 同上，靠 exclude 挡住；模板 `config.example.json`
+   用的是 `<你的服务器IP>` 占位符。
+
+> 检查方式：生成包之后 `git grep -I -E "8\.137|token 前缀"`，命中数必须为 0。
+
+### 六、还没做的
+
+- **没实际刷过**。自检全绿只证明"环境齐了"，不代表抖音的选择器对得上。
+  第一次真跑要看日志里的「跳过」原因。
+- **用户还没填「分享给谁」**（`shareToId` 为空）→ 现在只能把视频带回来在 QQ 聊，发不到抖音。
+- 抖音登录态未确认（`/jingxuan` 页不登录也能打开，自检判不出来）。
+
+### 七、回滚
+
+前端是静态文件，去掉 `data-gate` 那次改动不想要了，直接从备份覆盖 `index.html`：
+```bash
+cp /opt/qqbot/_bak/1024-1154-douyin/index.html /opt/qqbot/panel/public/
+```
