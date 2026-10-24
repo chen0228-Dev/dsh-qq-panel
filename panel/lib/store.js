@@ -552,6 +552,9 @@ export function publicConfig() {
     proactive: c.proactive,
     voice: { ...c.voice, volc: { ...c.voice.volc, accessToken: c.voice?.volc?.accessToken ? MASK : '' } },
     qzone: c.qzone,
+    // 2026-10-24 漏过一次：白名单里没它，导致保存成功、读回来是空、
+    // 前端 dy.enabled === undefined → 开关自动弹回关闭。加字段记得同步这里。
+    douyin: c.douyin,
     profiles: c.profiles,
     groups: c.groups,
     search: { ...c.search, apiKey: c.search?.apiKey ? MASK : '' },

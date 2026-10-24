@@ -4547,3 +4547,84 @@ document.querySelectorAll('[data-gate]').forEach((card) => {
 ```bash
 cp /opt/qqbot/_bak/1024-1154-douyin/index.html /opt/qqbot/panel/public/
 ```
+
+---
+
+## 六十三、开关保存后自动关闭（2026-10-24）
+
+### 现象
+
+用户的报障：面板点保存后，「允许她刷抖音」的开关**自己弹回关闭**。
+
+### 根因：`publicConfig()` 白名单漏了 `douyin`
+
+保存链路其实是通的 —— 查服务器上的 `config.json`：
+
+```
+enabled: True | shareToId: '' | likeLimit: 15
+```
+
+**值确实写进去了**。问题在读取：
+
+```js
+// store.js
+export function publicConfig() {
+  return {
+    qq, model, vision, persona, campus, whitelist, reply, features,
+    context, typing, capabilities, stickers, proactive, voice,
+    qzone,          ← 有这个
+    // douyin 没有 ← 就漏在这
+    profiles, groups, search, paths, proxy, dsh, access
+  }
+}
+```
+
+前端 `refresh()` 拿到的是这份白名单，`config.douyin` 是 `undefined`，
+于是 render 时：
+
+```js
+const dy = config.douyin || {}          // {}
+$('dy-enabled').checked = dy.enabled === true   // undefined === true → false
+```
+
+开关就被画成了关闭。**保存成功 → 读回来是空 → 显示关闭**，看起来像"保存失败"。
+
+### 改法
+
+`publicConfig()` 里补 `douyin: c.douyin`，并在旁边写了一句提醒：
+
+```js
+// 2026-10-24 漏过一次：白名单里没它，导致保存成功、读回来是空、
+// 前端 dy.enabled === undefined → 开关自动弹回关闭。加字段记得同步这里。
+douyin: c.douyin,
+```
+
+### 验证
+
+- 本地 `node --input-type=module` 调 `publicConfig()` → `douyin` 在、`enabled: false`（默认值）
+- 服务器上重启后 → `douyin` 在、`enabled: true`（用户的真实值）
+- `config.json` 里的值从头到尾没丢过
+
+### 教训
+
+**「保存不生效」要先分清是写失败还是读失败。**
+这次如果只看前端现象，很容易去查 `saveConfig` / deepMerge / 权限，
+实际上写完是好的，坏在读的白名单上。
+
+**判断方法**：直接看服务器上的 `config.json` 文件。
+文件里有值 = 写成功，问题在读；文件里没值 = 写失败。
+
+### 这一类坑的根
+
+`publicConfig()` 是**手工维护的白名单**，每加一个顶层配置段都得记得同步，
+否则就是「存得进、读不出、界面看起来没保存」。
+
+目前已知受这个影响的字段：`douyin`（本次）。之前 `groups` 也踩过同样的事
+（改备注名不生效那个问题）。
+
+**以后加配置段的检查清单**：
+1. `DEFAULT_CONFIG` 里加默认值
+2. `publicConfig()` 里加一行
+3. 前端 `render()` 里 `|| {}` 兜底
+4. `collect()` 里加分支
+5. 保存后刷新页面，确认值还在
